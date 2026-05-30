@@ -1347,13 +1347,13 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         <div class="form-group">
           <label class="form-label" for="username">管理账号</label>
           <div class="input-wrapper">
-            <input type="text" id="username" class="input-field" placeholder="请输入管理账号" required autocomplete="username">
+            <input type="text" id="username" name="username" class="input-field" placeholder="请输入管理账号" required autocomplete="username">
           </div>
         </div>
         <div class="form-group" style="margin-top: 16px;">
           <label class="form-label" for="password">安全密码</label>
           <div class="input-wrapper">
-            <input type="password" id="password" class="input-field" placeholder="请输入安全密码" required autocomplete="current-password">
+            <input type="password" id="password" name="password" class="input-field" placeholder="请输入安全密码" required autocomplete="current-password">
           </div>
           <div id="error_text" class="error-message"></div>
         </div>
@@ -1368,8 +1368,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <script>
     async function handleLogin(e) {
       e.preventDefault();
-      const uname = document.getElementById("username").value;
-      const pwd = document.getElementById("password").value;
+      const uname = document.getElementById("username").value.trim();
+      const pwd = document.getElementById("password").value.trim();
       const errorText = document.getElementById("error_text");
       const submitBtn = document.getElementById("submit_btn");
       
