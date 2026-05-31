@@ -383,10 +383,11 @@ def print_status():
     cfg = load_ui_cfg()
     ui_port = cfg.get("port", 8787)
     secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
+    proxy_port = cfg.get("proxy_port", 7928)
     state = load_state()
     is_connecting = state.get("is_connecting", False)
     
-    gateway_ok = check_port_listening(7928)
+    gateway_ok = check_port_listening(proxy_port)
     service_ok = check_service_active("aimilivpn.service")
     openvpn_ok = check_openvpn_process()
     pid = get_service_pid("aimilivpn.service")
@@ -413,7 +414,7 @@ def print_status():
     print_line(f"               {bold}AimiliVPN 管理终端 v2.0{reset}                  ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
-    print_line(format_line("代理网关 (Port 7928)", gateway_status))
+    print_line(format_line(f"代理网关 (Port {proxy_port})", gateway_status))
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
     
@@ -453,15 +454,15 @@ def print_status():
     else:
         print_line(format_line("节点状态", "无活动连接"))
     print_line()
-    local_proxy = state.get("local_proxy", "http://127.0.0.1:7928")
+    local_proxy = state.get("local_proxy", f"http://127.0.0.1:{proxy_port}")
     import urllib.parse
     try:
         parsed = urllib.parse.urlsplit(local_proxy)
         proxy_host = parsed.hostname or "127.0.0.1"
-        proxy_port = parsed.port or 7928
+        proxy_port = parsed.port or proxy_port
     except Exception:
         proxy_host = "127.0.0.1"
-        proxy_port = 7928
+        proxy_port = proxy_port
     
     if proxy_host == "::":
         socks_addr = "127.0.0.1"
@@ -657,26 +658,50 @@ def configure_web():
 
 def configure_port():
     cfg = load_ui_cfg()
-    print("\033[H\033[J", end="")
-    print("=======================================================")
-    print("                      管理端口配置                     ")
-    print("=======================================================")
-    print(f"当前网页管理端口为: {cfg.get('port', 8787)}")
-    try:
-        val = input("请输入新的管理端口 (1-65535, 按回车取消): ").strip()
-        if val:
-            port = int(val)
-            if 1 <= port <= 65535:
-                cfg['port'] = port
-                save_ui_cfg(cfg)
-                print(f"管理端口已更新为: {port}")
-                ask_restart()
-            else:
-                print("错误: 端口范围必须在 1 至 65535 之间。")
+    while True:
+        print("\033[H\033[J", end="")
+        print("=======================================================")
+        print("                      端口配置菜单                     ")
+        print("=======================================================")
+        print(f"1) 网页管理端口: {cfg.get('port', 8787)}")
+        print(f"2) 代理出站端口: {cfg.get('proxy_port', 7928)}")
+        print("3) 返回主菜单")
+        print("-------------------------------------------------------")
+        key = input("请选择操作 (1-3): ").strip()
+        if key == '1':
+            try:
+                val = input("请输入新的网页管理端口 (1-65535, 按回车取消): ").strip()
+                if val:
+                    port = int(val)
+                    if 1 <= port <= 65535:
+                        cfg['port'] = port
+                        save_ui_cfg(cfg)
+                        print(f"网页管理端口已更新为: {port}")
+                        ask_restart()
+                    else:
+                        print("错误: 端口范围必须在 1 至 65535 之间。")
+                        time.sleep(2)
+            except ValueError:
+                print("错误: 输入必须是数字。")
                 time.sleep(2)
-    except ValueError:
-        print("错误: 输入必须是数字。")
-        time.sleep(2)
+        elif key == '2':
+            try:
+                val = input("请输入新的代理出站端口 (1024-65535, 按回车取消): ").strip()
+                if val:
+                    port = int(val)
+                    if 1024 <= port <= 65535:
+                        cfg['proxy_port'] = port
+                        save_ui_cfg(cfg)
+                        print(f"代理出站端口已更新为: {port}")
+                        ask_restart()
+                    else:
+                        print("错误: 端口范围必须在 1024 至 65535 之间。")
+                        time.sleep(2)
+            except ValueError:
+                print("错误: 输入必须是数字。")
+                time.sleep(2)
+        elif key == '3' or key == 'q' or key == '\x03':
+            break
 
 def configure_credentials():
     cfg = load_ui_cfg()
@@ -771,6 +796,7 @@ def getch_timeout(timeout=1.0):
 def get_status_state():
     cfg = load_ui_cfg()
     state = load_state()
+    proxy_port = cfg.get("proxy_port", 7928)
     return (
         cfg.get("port", 8787),
         cfg.get("secret_path", "EJsW2EeBo9lY"),
@@ -784,7 +810,7 @@ def get_status_state():
         state.get("proxy_ip", "-"),
         state.get("proxy_latency_ms", 0),
         state.get("proxy_ok", False),
-        check_port_listening(7928),
+        check_port_listening(proxy_port),
         check_service_active("aimilivpn.service"),
         check_openvpn_process(),
         get_service_pid("aimilivpn.service")

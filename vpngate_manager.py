@@ -107,6 +107,11 @@ is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
 
+last_collector_heartbeat = 0.0
+last_checker_heartbeat = 0.0
+last_pinger_heartbeat = 0.0
+server_start_time = time.time()
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     CONFIG_DIR.mkdir(exist_ok=True)
@@ -203,9 +208,10 @@ _last_cleanup_time = 0.0
 def cleanup_old_logs(logs_dir: Path) -> None:
     global _last_cleanup_time
     now = time.time()
-    if now - _last_cleanup_time < 3600:
-        return
-    _last_cleanup_time = now
+    with lock:
+        if now - _last_cleanup_time < 3600:
+            return
+        _last_cleanup_time = now
     try:
         three_days_sec = 3 * 24 * 60 * 60
         for path in logs_dir.glob("*.json"):
@@ -217,11 +223,13 @@ def cleanup_old_logs(logs_dir: Path) -> None:
                     today_str = time.strftime("%Y-%m-%d", time.localtime())
                     today_time = time.mktime(time.strptime(today_str, "%Y-%m-%d"))
                     if today_time - file_time >= three_days_sec:
-                        path.unlink()
+                        with lock:
+                            path.unlink()
                         print(f"[清理] 已删除3天前的旧日志文件: {path.name}", flush=True)
                 except Exception:
                     if now - path.stat().st_mtime > three_days_sec:
-                        path.unlink()
+                        with lock:
+                            path.unlink()
     except Exception as e:
         print(f"[清理错误] 清理旧日志失败: {e}", flush=True)
 
@@ -237,8 +245,9 @@ def log_to_json(level: str, module: str, message: str) -> None:
             "module": module,
             "message": message
         }
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with lock:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         cleanup_old_logs(logs_dir)
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
@@ -283,16 +292,24 @@ def parse_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
-def fetch_api_text() -> str:
+def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
+    if url is None:
+        url = API_URL
     request = urllib.request.Request(
-        API_URL,
+        url,
         headers={
             "User-Agent": "Mozilla/5.0 vpngate-openvpn-manager/2.0",
             "Accept": "text/plain,*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=12) as response:
-        return response.read().decode("utf-8", errors="replace")
+    if url.startswith("https://") and not use_ssl_verify:
+        import ssl
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(request, timeout=12, context=ctx) as response:
+            return response.read().decode("utf-8", errors="replace")
+    else:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return response.read().decode("utf-8", errors="replace")
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
@@ -355,38 +372,61 @@ def fetch_candidates() -> list[dict[str, Any]]:
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
     
-    log_to_json("INFO", "Main", f"开始拉取官方 API 节点列表 (最大尝试次数: {max_attempts})...")
-    for i in range(max_attempts):
-        if i > 0:
-            time.sleep(1.5)
-        try:
-            api_text = fetch_api_text()
-            rows = parse_vpngate_rows(api_text)
-            for row in rows[:MAX_SCAN_ROWS]:
-                ip = row.get("IP", "")
-                if not ip or ip in seen_ips:
-                    continue
-                encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                if not encoded:
-                    continue
-                config_text = decode_config(encoded)
-                node = row_to_node(row, config_text)
-                candidates.append(node)
-                seen_ips.add(ip)
-        except Exception as e:
-            print(f"[fetch_candidates] Fetch {i+1} failed: {e}", flush=True)
-            log_to_json("WARNING", "Main", f"第 {i+1} 次拉取 API 节点失败: {e}")
-            if i == max_attempts - 1 and not candidates:
-                err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
-                full_err_msg = f"获取官方 API 节点失败: {e} | 诊断结果: {diag_msg}"
-                print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
-                log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
-                set_state(
-                    last_fetch_status="error",
-                    last_fetch_error_code=err_code,
-                    last_fetch_message=diag_msg
-                )
-                raise RuntimeError(diag_msg) from e
+    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
+    attempts_targets = [
+        (API_URL, True),
+        (API_URL, False)
+    ]
+    if API_URL.startswith("https://"):
+        attempts_targets.append((API_URL.replace("https://", "http://"), True))
+        
+    log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
+    
+    last_err = None
+    for url, verify_ssl in attempts_targets:
+        for i in range(max_attempts):
+            if i > 0:
+                time.sleep(1.5)
+            try:
+                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
+                print(f"[fetch_candidates] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
+                api_text = fetch_api_text(url, verify_ssl)
+                rows = parse_vpngate_rows(api_text)
+                for row in rows[:MAX_SCAN_ROWS]:
+                    ip = row.get("IP", "")
+                    if not ip or ip in seen_ips:
+                        continue
+                    encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                    if not encoded:
+                        continue
+                    config_text = decode_config(encoded)
+                    node = row_to_node(row, config_text)
+                    candidates.append(node)
+                    seen_ips.add(ip)
+                if candidates:
+                    break
+            except Exception as e:
+                last_err = e
+                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
+                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
+        if candidates:
+            break
+            
+    if not candidates:
+        err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
+        full_err_msg = f"获取官方 API 节点最终失败: {last_err} | 诊断结果: {diag_msg}"
+        print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
+        log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
+        set_state(
+            last_fetch_status="error",
+            last_fetch_error_code=err_code,
+            last_fetch_message=diag_msg
+        )
+        if last_err:
+            raise RuntimeError(diag_msg) from last_err
+        else:
+            raise RuntimeError(diag_msg)
                 
     set_state(
         last_fetch_at=time.time(),
@@ -1132,7 +1172,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
 
 def collector_loop() -> None:
+    global last_collector_heartbeat
     while True:
+        last_collector_heartbeat = time.time()
         success = False
         try:
             res = maintain_valid_nodes(force=False)
@@ -1695,6 +1737,72 @@ INDEX_HTML = r"""<!doctype html>
     .stat:nth-child(2) .stat-icon { color: var(--warning); }
     .stat:nth-child(3) .stat-icon { color: var(--success); }
 
+    /* New style additions */
+    .header-badge-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      height: 24px;
+      box-sizing: border-box;
+    }
+    .header-badge-link:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: var(--border-color-hover);
+      color: var(--text-primary);
+      transform: translateY(-1px);
+    }
+    .flex-row-container {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      margin-bottom: 24px;
+    }
+    .flex-row-container > * {
+      flex: 1;
+      min-width: 320px;
+      margin-bottom: 0 !important;
+    }
+    .vps-promo-tab {
+      position: fixed;
+      right: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 38px;
+      background: var(--primary-gradient);
+      border: 1px solid var(--border-color-hover);
+      border-right: none;
+      border-radius: 8px 0 0 8px;
+      padding: 16px 6px;
+      color: white;
+      font-weight: 700;
+      font-size: 13px;
+      line-height: 1.4;
+      text-align: center;
+      cursor: pointer;
+      z-index: 999;
+      box-shadow: -4px 0 20px rgba(99, 102, 241, 0.3);
+      transition: all 0.3s ease;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+    .vps-promo-tab:hover {
+      padding-right: 10px;
+      box-shadow: -4px 0 25px rgba(99, 102, 241, 0.5);
+    }
+
     .ad-section {
       background: var(--bg-surface);
       backdrop-filter: blur(12px);
@@ -2227,20 +2335,27 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
       AimiliVPN 节点管理系统
     </h1>
-    <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
+    <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
+    <div class="dropdown">
+      <button id="github_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        GITHUB
+        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
+      </button>
+      <div id="github_dropdown" class="dropdown-content">
+        <a href="https://github.com/baoweise-bot/aimili-vpngate" target="_blank">正式版</a>
+        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/bate" target="_blank">测试版</a>
+      </div>
+    </div>
+    <a href="https://t.me/arestemple" target="_blank" class="btn-primary" style="background: rgba(43, 162, 223, 0.15); border: 1px solid rgba(43, 162, 223, 0.3); color: #2ba2df; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; height: 38px; box-sizing: border-box; font-weight: 600;">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
+      Telegram
+    </a>
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
-    </button>
-    <button id="check" class="btn-primary">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-      立即检测补齐
-    </button>
-    <button onclick="openRoutingModal()" class="btn-primary" style="background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" /></svg>
-      出站路由
     </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
@@ -2249,9 +2364,21 @@ INDEX_HTML = r"""<!doctype html>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="admin_dropdown" class="dropdown-content">
-        <a href="javascript:void(0)" onclick="openSettingsModal()">
+        <a href="javascript:void(0)" onclick="openCredentialsModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+          账号密码设置
+        </a>
+        <a href="javascript:void(0)" onclick="openNetworkModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          管理员设置
+          代理及网络设置
+        </a>
+        <a href="javascript:void(0)" onclick="openGatewayModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+          网关
+        </a>
+        <a href="javascript:void(0)" onclick="openLogsModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+          日志
         </a>
         <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger); border-top: 1px solid rgba(255,255,255,0.05);">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
@@ -2262,99 +2389,13 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  <section class="ad-section">
-    <div class="ad-card">
-      <div class="ad-title">
-        <span class="ad-badge">推荐</span> <strong>购买高性价比 VPS 搭建节点或用作客户端</strong>
-      </div>
-      <div class="ad-links">
-        <div class="ad-item">
-          <span class="ad-tag tag-normal">普通用户推荐</span>
-          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-opt">网络优化推荐</span>
-          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
-          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-premium">高端企业推荐</span>
-          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-      </div>
-      <div class="ad-footer">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
-      </div>
-    </div>
-  </section>
+  
+    <!-- 当前连接活动节点卡片 -->
+    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
+      <!-- Rendered dynamically by render() -->
+    </section>
 
-  <!-- 当前连接活动节点卡片 -->
-  <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
-    <!-- Rendered dynamically by render() -->
-  </section>
 
-  <section class="stats">
-    <div class="stat">
-      <div class="stat-info">
-        <strong id="total">0</strong>
-        <span>可用节点池</span>
-      </div>
-      <div class="stat-icon-wrapper">
-        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
-      </div>
-    </div>
-    <div class="stat">
-      <div class="stat-info">
-        <strong id="target">3</strong>
-        <span>目标储备数</span>
-      </div>
-      <div class="stat-icon-wrapper">
-        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-      </div>
-    </div>
-    <div class="stat">
-      <div class="stat-info">
-        <strong id="active">0</strong>
-        <span>已激活连接</span>
-      </div>
-      <div class="stat-icon-wrapper">
-        <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-      </div>
-    </div>
-  </section>
-
-  <section class="proxy-test-section" style="margin-bottom: 24px;">
-    <div class="stat" style="display: flex; flex-direction: row; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; flex-wrap: wrap; gap: 16px;">
-      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-        <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.1); border-color: rgba(99, 102, 241, 0.2);">
-          <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--primary);"><path stroke-linecap="round" stroke-linejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071a10.5 10.5 0 0114.14 0M1.414 8.05a16 16 0 0121.172 0" /></svg>
-        </div>
-        <div>
-          <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: 600; color: var(--text-primary);">本地代理出口检测</h3>
-          <p style="margin: 0; font-size: 13px; color: var(--text-secondary);">
-            测试本地 HTTP/SOCKS5 代理是否成功通过当前 VPN 节点出站，并获取实际出口公网 IP 和延迟。
-          </p>
-        </div>
-      </div>
-      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-left: auto;">
-        <div id="proxy_test_result" style="text-align: right;">
-          <div style="font-size: 14px; font-weight: 500; color: var(--text-secondary);">
-            测试状态: <span id="proxy_status_badge" class="badge not_checked" style="margin-left: 4px;">未检测</span>
-          </div>
-          <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
-            出口 IP: <span id="proxy_ip_val" class="mono" style="font-weight: 600; color: var(--text-primary);">-</span> 
-            <span id="proxy_latency_val" style="margin-left: 8px;"></span>
-          </div>
-        </div>
-        <button id="btn_test_proxy" class="btn-primary" style="height: 40px; padding: 0 16px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          测试代理
-        </button>
-      </div>
-    </div>
-  </section>
 
   <section class="toolbar">
     <select id="country_filter">
@@ -2403,113 +2444,246 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Settings Modal -->
-  <div id="settings_modal" class="modal">
+  <!-- Credentials Modal (账号密码设置) -->
+  <div id="credentials_modal" class="modal">
     <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          管理员设置
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+          账号密码设置
         </h3>
-        <button type="button" onclick="closeSettingsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+        <button type="button" onclick="closeCredentialsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
       
-      <div id="settings_error" style="color: var(--danger); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 6px; display: none;"></div>
-      <div id="settings_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
+      <div id="credentials_error" style="color: var(--danger); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 6px; display: none;"></div>
+      <div id="credentials_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
 
-      <form id="settings_form" onsubmit="saveSettings(event)">
-        <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
-          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">修改网页访问配置</div>
-          
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_port">网页端口</label>
-            <input type="number" id="settings_port" class="input-field" required min="1" max="65535" placeholder="8787">
-          </div>
-          
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_suffix">登录安全后缀 (仅字母数字)</label>
-            <input type="text" id="settings_suffix" class="input-field" required pattern="[A-Za-z0-9]+" placeholder="EJsW2EeBo9lY">
-          </div>
-
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_new_username">新管理账号 (留空则不修改)</label>
-            <input type="text" id="settings_new_username" class="input-field" placeholder="留空则不修改">
-          </div>
-          
-          <div class="form-group">
-            <label class="form-label" for="settings_new_password">新安全密码 (留空则不修改)</label>
-            <input type="password" id="settings_new_password" class="input-field" placeholder="留空则不修改">
-          </div>
+      <form id="credentials_form" onsubmit="saveCredentials(event)">
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="cred_username">新管理账号</label>
+          <input type="text" id="cred_username" class="input-field" required placeholder="请输入新管理账号">
         </div>
         
-        <div style="margin-bottom: 24px;">
-          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">安全验证 (必须输入当前账号密码)</div>
-          
-          <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_curr_username">当前管理账号</label>
-            <input type="text" id="settings_curr_username" class="input-field" required placeholder="请输入当前管理账号">
-          </div>
-          
-          <div class="form-group">
-            <label class="form-label" for="settings_curr_password">当前安全密码</label>
-            <input type="password" id="settings_curr_password" class="input-field" required placeholder="请输入当前安全密码">
-          </div>
+        <div class="form-group" style="margin-bottom: 24px;">
+          <label class="form-label" for="cred_password">新安全密码</label>
+          <input type="password" id="cred_password" class="input-field" required placeholder="请输入新安全密码">
         </div>
         
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
-          <button type="button" onclick="closeSettingsModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
-          <button type="submit" id="settings_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
+          <button type="button" onclick="closeCredentialsModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
+          <button type="submit" id="credentials_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
         </div>
       </form>
     </div>
   </div>
 
-  <!-- Routing Modal -->
-  <div id="routing_modal" class="modal">
-    <div class="modal-content" style="max-width: 460px;">
+  <!-- Network Modal (代理及网络设置，包括出站路由) -->
+  <div id="network_modal" class="modal">
+    <div class="modal-content" style="max-width: 480px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: #a855f7;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" /></svg>
-          出站 IP 路由设置
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+          代理与网络设置
         </h3>
-        <button type="button" onclick="closeRoutingModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+        <button type="button" onclick="closeNetworkModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
       
-      <div id="routing_error" style="color: var(--danger); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 6px; display: none;"></div>
-      <div id="routing_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
+      <div id="network_error" style="color: var(--danger); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.2); border-radius: 6px; display: none;"></div>
+      <div id="network_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
 
-      <form id="routing_form" onsubmit="saveRoutingSettings(event)">
-        <div style="margin-bottom: 20px;">
+      <form id="network_form" onsubmit="saveNetwork(event)">
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label class="form-label" for="net_port">网页管理端口</label>
+          <input type="number" id="net_port" class="input-field" required min="1" max="65535" placeholder="8787">
+        </div>
+        
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label class="form-label" for="net_suffix">登录安全后缀 (仅字母和数字)</label>
+          <input type="text" id="net_suffix" class="input-field" required pattern="[A-Za-z0-9]+" placeholder="EJsW2EeBo9lY">
+        </div>
+
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理出站端口</label>
+          <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
+        </div>
+
+        <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_routing_mode">IP 路由模式</label>
-            <select id="settings_routing_mode" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;" onchange="handleRoutingModeChange(this.value)">
+            <label class="form-label" for="net_routing_mode">IP 出站路由模式</label>
+            <select id="net_routing_mode" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;" onchange="handleRoutingModeChange(this.value)">
               <option value="auto">自动配置 (智能切换，最稳定)</option>
               <option value="fixed_ip">固定 IP (永不自动换 IP)</option>
               <option value="fixed_region">固定地区 (锁定特定国家节点)</option>
             </select>
           </div>
           
-          <div id="settings_force_country_group" class="form-group" style="margin-bottom: 12px; display: none;">
-            <label class="form-label" for="settings_force_country">锁定国家地区</label>
-            <select id="settings_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
+          <div id="net_force_country_group" class="form-group" style="margin-bottom: 12px; display: none;">
+            <label class="form-label" for="net_force_country">锁定国家地区</label>
+            <select id="net_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
               <option value="">正在加载节点国家...</option>
             </select>
           </div>
           
-          <div id="settings_routing_warning" style="font-size: 12px; color: var(--warning); line-height: 1.4; padding: 8px 12px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: 6px; margin-top: 8px;">
+          <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
             ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。
           </div>
         </div>
         
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
-          <button type="button" onclick="closeRoutingModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
-          <button type="submit" id="routing_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px; background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);">保存路由配置</button>
+          <button type="button" onclick="closeNetworkModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
+          <button type="submit" id="network_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Ad Modal (VPS 购买推荐) -->
+  <div id="ad_modal" class="modal">
+    <div class="modal-content" style="max-width: 640px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--warning);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364.364l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+          VPS 购买推荐
+        </h3>
+        <button type="button" onclick="closeAdModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      
+      <div class="ad-links" style="grid-template-columns: 1fr; gap: 16px;">
+        <div class="ad-item">
+          <span class="ad-tag tag-normal">普通用户推荐</span>
+          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
+          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+        <div class="ad-item">
+          <span class="ad-tag tag-opt">网络优化推荐</span>
+          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
+          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+        <div class="ad-item">
+          <span class="ad-tag tag-premium">高端企业推荐</span>
+          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
+          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
+        </div>
+      </div>
+      
+      <div class="ad-footer" style="margin-top: 20px;">
+        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="vps-promo-tab" onclick="openAdModal()">VPS购买推荐</div>
+
+  <!-- Gateway Modal (网关自检与代理测试) -->
+  <div id="gateway_modal" class="modal">
+    <div class="modal-content" style="max-width: 600px; width: 90%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+          网关运行状态与自检
+        </h3>
+        <button type="button" onclick="closeGatewayModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <!-- 服务列表 -->
+      <div id="gateway_services_list" style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px;">
+        <div style="text-align: center; color: var(--text-secondary); padding: 20px 0;">
+          <svg style="animation: spin 1s linear infinite; width: 20px; height: 20px; display: inline-block; margin-bottom: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>
+          <div>正在加载系统网关状态...</div>
+        </div>
+      </div>
+
+      <!-- 分割线 -->
+      <div style="border-top: 1px dashed rgba(255, 255, 255, 0.08); margin: 20px 0;"></div>
+
+      <!-- 本地代理出口检测 -->
+      <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px;">
+        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+          <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.1); border-color: rgba(99, 102, 241, 0.2); width: 36px; height: 36px; border-radius: 8px; flex-shrink: 0;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--primary); width: 18px; height: 18px;"><path stroke-linecap="round" stroke-linejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071a10.5 10.5 0 0114.14 0M1.414 8.05a16 16 0 0121.172 0" /></svg>
+          </div>
+          <div>
+            <h4 style="margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary);">本地代理出口检测</h4>
+            <p style="margin: 2px 0 0 0; font-size: 12px; color: var(--text-secondary);">检测 HTTP/SOCKS5 代理出站连通性与 IP</p>
+          </div>
+        </div>
+        
+        <div style="display: flex; justify-content: space-between; align-items: center; background: rgba(0, 0, 0, 0.2); border-radius: 8px; padding: 12px; margin-bottom: 12px; flex-wrap: wrap; gap: 10px;">
+          <div style="font-size: 13px; color: var(--text-secondary);">
+            测试状态: <span id="proxy_status_badge" class="badge not_checked" style="margin-left: 4px;">未检测</span>
+          </div>
+          <div style="font-size: 13px; color: var(--text-secondary); text-align: right;">
+            出口 IP: <span id="proxy_ip_val" class="mono" style="font-weight: 600; color: var(--text-primary);">-</span> 
+            <span id="proxy_latency_val" style="margin-left: 6px;"></span>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 12px; justify-content: flex-end;">
+          <button id="btn_test_proxy" class="btn-primary" style="height: 36px; padding: 0 16px; font-size: 13px;">
+            <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+            开始检测
+          </button>
+        </div>
+      </div>
+      
+      <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
+        <button type="button" onclick="closeGatewayModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs Modal (日志监控与分类筛选) -->
+  <div id="logs_modal" class="modal">
+    <div class="modal-content" style="max-width: 800px; width: 95%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+          今日运行日志
+        </h3>
+        
+        <div style="display: flex; align-items: center; gap: 10px; margin-left: auto;">
+          <label class="form-label" for="log_filter_select" style="margin: 0; font-size: 13px; color: var(--text-secondary);">日志筛选:</label>
+          <select id="log_filter_select" class="input-field" style="width: 140px; height: 32px; font-size: 12px; border-radius: 6px; padding: 0 8px; background: rgba(255, 255, 255, 0.03);" onchange="filterAndRenderLogs()">
+            <option value="all">全部日志</option>
+            <option value="proxy">代理相关 (Proxy)</option>
+            <option value="vpn">VPN 连接 (VPN)</option>
+            <option value="system">系统运行 (Main/Route)</option>
+          </select>
+        </div>
+        
+        <button type="button" onclick="closeLogsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <!-- Terminal Log Container -->
+      <div id="log_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; height: 400px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-all; color: #a5b4fc; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); position: relative; margin-bottom: 20px;">
+        <div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">
+          暂无今日运行日志记录。
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div style="display: flex; gap: 8px;">
+          <button type="button" onclick="copyLogContent()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
+            <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px; margin-right: 4px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+            一键复制
+          </button>
+          <button type="button" onclick="exportLogContent()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
+            <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px; margin-right: 4px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+            导出日志
+          </button>
+        </div>
+        <button type="button" onclick="closeLogsModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
     </div>
   </div>
 </main>
@@ -2668,7 +2842,7 @@ function render(){
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
-  if (state.is_connecting) {
+  if (state.is_connecting && !activeNode) {
     activeCardContainer.innerHTML = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
         <div class="active-card-info">
@@ -2748,7 +2922,7 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${localProxy} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${localProxy} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`; }
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -3063,12 +3237,6 @@ $("refresh").onclick=async()=>{
     $("refresh").textContent="更新节点";
   }, 3000);
 };
-$("check").onclick=async()=>{ 
-  $("check").disabled=true; 
-  $("check").textContent="检测中..."; 
-  try{await fetch("./api/check",{method:"POST"}); await load();} 
-  finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
-};
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
@@ -3109,23 +3277,38 @@ $("btn_test_proxy").onclick = async () => {
   }
 };
 
-// Admin dropdown toggle
+// Admin dropdown toggle & GitHub dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
+const githubBtn = $("github_btn");
+const githubDropdown = $("github_dropdown");
+
 if (adminBtn && adminDropdown) {
   adminBtn.onclick = (e) => {
     e.stopPropagation();
     const isShow = adminDropdown.style.display === "block";
     adminDropdown.style.display = isShow ? "none" : "block";
+    if (githubDropdown) githubDropdown.style.display = "none";
   };
-  document.addEventListener("click", () => {
-    adminDropdown.style.display = "none";
-  });
 }
 
+if (githubBtn && githubDropdown) {
+  githubBtn.onclick = (e) => {
+    e.stopPropagation();
+    const isShow = githubDropdown.style.display === "block";
+    githubDropdown.style.display = isShow ? "none" : "block";
+    if (adminDropdown) adminDropdown.style.display = "none";
+  };
+}
+
+document.addEventListener("click", () => {
+  if (adminDropdown) adminDropdown.style.display = "none";
+  if (githubDropdown) githubDropdown.style.display = "none";
+});
+
 function handleRoutingModeChange(mode) {
-  const countryGroup = $("settings_force_country_group");
-  const warningDiv = $("settings_routing_warning");
+  const countryGroup = $("net_force_country_group");
+  const warningDiv = $("net_routing_warning");
   
   if (mode === "fixed_region") {
     countryGroup.style.display = "block";
@@ -3138,7 +3321,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定IP</strong>：锁定当前连接的节点。不管该节点是否失效，系统都绝不自动切换至其他IP；如果节点由于网络故障失效，会造成代理中断（但如果OpenVPN连接意外退出，脚本将尝试为您在后台重新拉起连接同一IP）。<br><strong>提示</strong>：您可以在主页的节点列表中直接点击“连接”按钮来选择并锁定不同的IP节点。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定IP</strong>：锁定当前连接的节点。不管该节点是否失效，系统都绝不自动切换至其他IP；如果节点由于网络故障失效，会造成代理中断（但如果OpenVPN连接意外退出，脚本将尝试为您在后台重新拉起连接同一IP）。<br><strong>提示</strong>：您可以在主页 of 节点列表中直接点击“连接”按钮来选择并锁定不同的IP节点。`;
   } else {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--text-secondary)";
@@ -3149,7 +3332,8 @@ function handleRoutingModeChange(mode) {
 }
 
 function populateRoutingCountries() {
-  const select = $("settings_force_country");
+  const select = $("net_force_country");
+  if (!select) return;
   const countMap = {};
   nodes.forEach(n => {
     if (n.country) {
@@ -3166,39 +3350,42 @@ function populateRoutingCountries() {
   
   if (state) {
     const mode = state.routing_mode || "auto";
-    $("settings_routing_mode").value = mode;
+    const modeSelect = $("net_routing_mode");
+    if (modeSelect) modeSelect.value = mode;
     select.value = state.force_country || "";
     handleRoutingModeChange(mode);
   }
 }
 
-function openRoutingModal() {
-  $("routing_error").style.display = "none";
-  $("routing_success").style.display = "none";
-  $("routing_form").reset();
-  populateRoutingCountries();
-  $("routing_modal").style.display = "flex";
+function openCredentialsModal() {
+  $("credentials_error").style.display = "none";
+  $("credentials_success").style.display = "none";
+  $("credentials_form").reset();
+  if (state) {
+    $("cred_username").value = state.username || "";
+  }
+  $("credentials_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
 }
 
-function closeRoutingModal() {
-  $("routing_modal").style.display = "none";
+function closeCredentialsModal() {
+  $("credentials_modal").style.display = "none";
 }
 
-async function saveRoutingSettings(e) {
+async function saveCredentials(e) {
   e.preventDefault();
-  const errorDivEl = $("routing_error");
-  const successDiv = $("routing_success");
-  const submitBtn = $("routing_submit_btn");
+  const errorDivEl = $("credentials_error");
+  const successDiv = $("credentials_success");
+  const submitBtn = $("credentials_submit_btn");
   
   errorDivEl.style.display = "none";
   successDiv.style.display = "none";
   
-  const routingMode = $("settings_routing_mode").value;
-  const forceCountry = $("settings_force_country").value;
+  const username = $("cred_username").value.trim();
+  const password = $("cred_password").value.trim();
   
-  if (routingMode === "fixed_region" && !forceCountry) {
-    errorDivEl.textContent = "请选择一个要锁定的目标国家";
+  if (!username || !password) {
+    errorDivEl.textContent = "用户名和密码不能为空";
     errorDivEl.style.display = "block";
     return;
   }
@@ -3207,79 +3394,95 @@ async function saveRoutingSettings(e) {
   submitBtn.textContent = "正在保存...";
   
   try {
-    const res = await fetch("./api/update_routing", {
+    const res = await fetch("./api/update_credentials", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        routing_mode: routingMode,
-        force_country: forceCountry
-      })
+      body: JSON.stringify({ username, password })
     });
     
     const data = await res.json();
     if (res.ok && data.ok) {
-      successDiv.textContent = "路由配置保存成功，已即时生效！";
+      successDiv.textContent = "账号密码保存成功，已即时生效！";
       successDiv.style.display = "block";
       setTimeout(() => {
-        closeRoutingModal();
+        closeCredentialsModal();
         load();
       }, 1500);
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
       errorDivEl.style.display = "block";
       submitBtn.disabled = false;
-      submitBtn.textContent = "保存路由配置";
+      submitBtn.textContent = "保存修改";
     }
   } catch (err) {
-    errorDivEl.textContent = "保存失败，请重试";
+    errorDivEl.textContent = "连接服务器失败，请稍后重试";
     errorDivEl.style.display = "block";
     submitBtn.disabled = false;
-    submitBtn.textContent = "保存路由配置";
+    submitBtn.textContent = "保存修改";
   }
 }
 
-function openSettingsModal() {
-  $("settings_error").style.display = "none";
-  $("settings_success").style.display = "none";
-  $("settings_form").reset();
+function openNetworkModal() {
+  $("network_error").style.display = "none";
+  $("network_success").style.display = "none";
+  $("network_form").reset();
   
   if (state) {
-    $("settings_port").value = state.port || 8787;
-    $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
+    $("net_port").value = state.port || 8787;
+    $("net_suffix").value = state.secret_path || "";
+    $("net_proxy_port").value = state.proxy_port || 7928;
   }
   
-  $("settings_modal").style.display = "flex";
+  populateRoutingCountries();
+  $("network_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
 }
 
-function closeSettingsModal() {
-  $("settings_modal").style.display = "none";
+function closeNetworkModal() {
+  $("network_modal").style.display = "none";
 }
 
-async function saveSettings(e) {
+async function saveNetwork(e) {
   e.preventDefault();
-  const errorDivEl = $("settings_error");
-  const successDiv = $("settings_success");
-  const submitBtn = $("settings_submit_btn");
+  const errorDivEl = $("network_error");
+  const successDiv = $("network_success");
+  const submitBtn = $("network_submit_btn");
   
   errorDivEl.style.display = "none";
   successDiv.style.display = "none";
   
-  const port = parseInt($("settings_port").value);
-  const suffix = $("settings_suffix").value.trim();
-  const newUsername = $("settings_new_username").value.trim();
-  const newPassword = $("settings_new_password").value.trim();
-  const currUsername = $("settings_curr_username").value.trim();
-  const currPassword = $("settings_curr_password").value.trim();
+  const port = parseInt($("net_port").value);
+  const suffix = $("net_suffix").value.trim();
+  const proxyPort = parseInt($("net_proxy_port").value);
+  const routingMode = $("net_routing_mode").value;
+  const forceCountry = $("net_force_country").value;
   
   if (isNaN(port) || port < 1 || port > 65535) {
-    errorDivEl.textContent = "端口范围必须在 1 至 65535 之间";
+    errorDivEl.textContent = "网页管理端口范围必须在 1 至 65535 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+  
+  if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
+    errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (proxyPort === port) {
+    errorDivEl.textContent = "代理出站端口不能与网页管理端口相同";
     errorDivEl.style.display = "block";
     return;
   }
   
   if (!/^[A-Za-z0-9]+$/.test(suffix)) {
     errorDivEl.textContent = "登录安全后缀仅能由英文字母和数字组成";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (routingMode === "fixed_region" && !forceCountry) {
+    errorDivEl.textContent = "请选择一个要锁定的目标国家";
     errorDivEl.style.display = "block";
     return;
   }
@@ -3294,20 +3497,19 @@ async function saveSettings(e) {
       body: JSON.stringify({
         port: port,
         secret_path: suffix,
-        new_username: newUsername,
-        new_password: newPassword,
-        curr_username: currUsername,
-        curr_password: currPassword
+        proxy_port: proxyPort,
+        routing_mode: routingMode,
+        force_country: forceCountry
       })
     });
     
     const data = await res.json();
     if (res.ok && data.ok) {
       if (data.restart_needed) {
-        successDiv.textContent = "保存成功！端口/安全路径已变更，页面将在 4 秒内自动跳转...";
+        successDiv.textContent = "保存成功！网页端口或路径已变更，页面将在 4 秒内自动跳转...";
         successDiv.style.display = "block";
         
-        const inputs = $("settings_form").querySelectorAll("input, button, select");
+        const inputs = $("network_form").querySelectorAll("input, button, select");
         inputs.forEach(el => el.disabled = true);
         
         setTimeout(() => {
@@ -3319,7 +3521,7 @@ async function saveSettings(e) {
         successDiv.textContent = "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
         setTimeout(() => {
-          closeSettingsModal();
+          closeNetworkModal();
           load();
         }, 1500);
       }
@@ -3335,6 +3537,14 @@ async function saveSettings(e) {
     submitBtn.disabled = false;
     submitBtn.textContent = "保存修改";
   }
+}
+
+function openAdModal() {
+  $("ad_modal").style.display = "flex";
+}
+
+function closeAdModal() {
+  $("ad_modal").style.display = "none";
 }
 
 async function logoutAdmin() {
@@ -3365,6 +3575,180 @@ setInterval(async () => {
     } catch(e) {}
   }
 }, 10000);
+let gatewayPollInterval = null;
+
+function openGatewayModal() {
+  $("admin_dropdown").style.display = "none";
+  $("gateway_modal").style.display = "flex";
+  loadGatewayStatus();
+  if (gatewayPollInterval) clearInterval(gatewayPollInterval);
+  gatewayPollInterval = setInterval(loadGatewayStatus, 3000);
+}
+
+function closeGatewayModal() {
+  $("gateway_modal").style.display = "none";
+  if (gatewayPollInterval) {
+    clearInterval(gatewayPollInterval);
+    gatewayPollInterval = null;
+  }
+}
+
+async function loadGatewayStatus() {
+  try {
+    const res = await fetch("./api/gateway_status");
+    const data = await res.json();
+    if (data.ok && data.services) {
+      renderGatewayServices(data.services);
+    }
+  } catch (e) {
+    console.error("加载网关状态失败", e);
+  }
+}
+
+function renderGatewayServices(services) {
+  const container = $("gateway_services_list");
+  if (!container) return;
+  
+  let html = "";
+  services.forEach(s => {
+    const statusText = s.status === "running" ? "正在运行" : "已停止";
+    const badgeClass = s.status === "running" ? "available" : "unavailable";
+    const statusPulse = s.status === "running" ? '<span class="badge-pulse"></span>' : '';
+    
+    html += `
+      <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px 16px; display: flex; flex-direction: column; gap: 6px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong style="font-size: 14px; color: var(--text-primary);">${esc(s.name)}</strong>
+          <span class="badge ${badgeClass}">${statusPulse}${statusText}</span>
+        </div>
+        <div style="font-size: 12px; color: var(--text-secondary);">${esc(s.details || "-")}</div>
+        ${s.error ? `
+          <div style="font-size: 12px; color: var(--danger); background: rgba(244,63,94,0.08); border: 1px solid rgba(244,63,94,0.15); border-radius: 6px; padding: 6px 10px; margin-top: 4px; line-height: 1.4;">
+            ⚠️ 诊断原因: ${esc(s.error)}
+          </div>
+        ` : ''}
+      </div>
+    `;
+  });
+  container.innerHTML = html;
+}
+
+let logsPollInterval = null;
+let rawLogsCache = [];
+
+function openLogsModal() {
+  $("admin_dropdown").style.display = "none";
+  $("logs_modal").style.display = "flex";
+  loadLogs();
+  if (logsPollInterval) clearInterval(logsPollInterval);
+  logsPollInterval = setInterval(loadLogs, 2500);
+}
+
+function closeLogsModal() {
+  $("logs_modal").style.display = "none";
+  if (logsPollInterval) {
+    clearInterval(logsPollInterval);
+    logsPollInterval = null;
+  }
+}
+
+async function loadLogs() {
+  try {
+    const res = await fetch("./api/logs");
+    const data = await res.json();
+    if (data.logs) {
+      rawLogsCache = data.logs;
+      filterAndRenderLogs();
+    }
+  } catch (e) {
+    console.error("加载日志失败", e);
+  }
+}
+
+function filterAndRenderLogs() {
+  const filterVal = $("log_filter_select").value;
+  const term = $("log_terminal_container");
+  if (!term) return;
+  
+  let filtered = rawLogsCache;
+  if (filterVal === "proxy") {
+    filtered = rawLogsCache.filter(l => l.module === "Proxy");
+  } else if (filterVal === "vpn") {
+    filtered = rawLogsCache.filter(l => l.module === "VPN");
+  } else if (filterVal === "system") {
+    filtered = rawLogsCache.filter(l => !["Proxy", "VPN"].includes(l.module));
+  }
+  
+  if (filtered.length === 0) {
+    term.innerHTML = `<div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">暂无该类型日志。</div>`;
+    return;
+  }
+  
+  const linesHtml = filtered.map(l => {
+    let color = "#a5b4fc";
+    if (l.module === "Proxy") color = "#38bdf8";
+    if (l.module === "VPN") color = "#34d399";
+    if (l.level === "WARNING") color = "#fbbf24";
+    if (l.level === "ERROR") color = "#f43f5e";
+    
+    return `<div style="color: ${color}; margin-bottom: 4px;">[${esc(l.timestamp)}] [${esc(l.level)}] [${esc(l.module)}] ${esc(l.message)}</div>`;
+  }).join("");
+  
+  const isAtBottom = term.scrollHeight - term.clientHeight <= term.scrollTop + 50;
+  
+  term.innerHTML = linesHtml;
+  
+  if (isAtBottom) {
+    term.scrollTop = term.scrollHeight;
+  }
+}
+
+function copyLogContent() {
+  const term = $("log_terminal_container");
+  if (!term) return;
+  
+  const text = term.innerText || term.textContent;
+  if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
+    alert("当前没有可供复制的日志。");
+    return;
+  }
+  
+  navigator.clipboard.writeText(text).then(() => {
+    alert("日志内容已成功复制到剪贴板！");
+  }).catch(err => {
+    console.error("复制失败", err);
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    alert("日志内容已复制到剪贴板！");
+  });
+}
+
+function exportLogContent() {
+  const term = $("log_terminal_container");
+  if (!term) return;
+  
+  const text = term.innerText || term.textContent;
+  if (!text || text.includes("暂无今日") || text.includes("暂无该类型")) {
+    alert("当前没有可供导出的日志。");
+    return;
+  }
+  
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const filterVal = $("log_filter_select").value;
+  a.download = `vpngate_log_${filterVal}_${dateStr}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 </script>
 </body></html>"""
 
@@ -3378,7 +3762,16 @@ def check_proxy_health() -> dict[str, Any]:
         connect_host = LOCAL_PROXY_HOST
         if connect_host in ("::", "0.0.0.0", ""):
             connect_host = "::1" if is_ipv6 else "127.0.0.1"
-        s.connect((connect_host, LOCAL_PROXY_PORT))
+        try:
+            s.connect((connect_host, LOCAL_PROXY_PORT))
+        except Exception as e:
+            if connect_host == "::1":
+                s.close()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.5)
+                s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+            else:
+                raise e
     except Exception as e:
         diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
         diag_msg = diag[1] if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e}"
@@ -3402,23 +3795,25 @@ def check_proxy_health() -> dict[str, Any]:
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     def _curl_check_ip(url: str) -> dict[str, Any] | None:
-        proxy_host = LOCAL_PROXY_HOST
-        if proxy_host == "::":
-            proxy_url = f"socks5h://[::1]:{LOCAL_PROXY_PORT}"
-        elif proxy_host == "0.0.0.0":
-            proxy_url = f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}"
-        elif ":" in proxy_host:
-            proxy_url = f"socks5h://[{proxy_host}]:{LOCAL_PROXY_PORT}"
+        proxy_hosts = []
+        if LOCAL_PROXY_HOST == "::":
+            proxy_hosts = ["[::1]", "127.0.0.1"]
+        elif LOCAL_PROXY_HOST == "0.0.0.0":
+            proxy_hosts = ["127.0.0.1"]
+        elif ":" in LOCAL_PROXY_HOST:
+            proxy_hosts = [f"[{LOCAL_PROXY_HOST}]", "127.0.0.1"]
         else:
-            proxy_url = f"socks5h://{proxy_host}:{LOCAL_PROXY_PORT}"
-            
-        cmd = [
-            "curl", "-s",
-            "-w", "\n%{time_total} %{http_code}",
-            "-x", proxy_url,
-            url,
-            "--max-time", "5"
-        ]
+            proxy_hosts = [LOCAL_PROXY_HOST]
+
+        for p_host in proxy_hosts:
+            proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
+            cmd = [
+                "curl", "-s",
+                "-w", "\n%{time_total} %{http_code}",
+                "-x", proxy_url,
+                url,
+                "--max-time", "5"
+            ]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
             if res.returncode == 0:
@@ -3452,8 +3847,10 @@ def check_proxy_health() -> dict[str, Any]:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
 def background_proxy_checker() -> None:
+    global last_checker_heartbeat
     time.sleep(30)
     while True:
+        last_checker_heartbeat = time.time()
         try:
             if is_connecting:
                 time.sleep(5)
@@ -3497,7 +3894,9 @@ def background_proxy_checker() -> None:
         time.sleep(30)
 
 def active_node_pinger() -> None:
+    global last_pinger_heartbeat
     while True:
+        last_pinger_heartbeat = time.time()
         try:
             if active_openvpn_running() and active_openvpn_node_id:
                 nodes = read_json(NODES_FILE, [])
@@ -3642,6 +4041,120 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        elif effective_path == "/api/gateway_status":
+            web_ui_status = {
+                "name": "Web 管理服务",
+                "status": "running",
+                "details": f"监听地址: {load_ui_config().get('host', UI_HOST)}:{load_ui_config().get('port', UI_PORT)}",
+                "error": ""
+            }
+            proxy_ok = False
+            proxy_err = ""
+            is_ipv6 = ":" in LOCAL_PROXY_HOST
+            af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+            s = socket.socket(af, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            try:
+                connect_host = LOCAL_PROXY_HOST
+                if connect_host in ("::", "0.0.0.0", ""):
+                    connect_host = "::1" if is_ipv6 else "127.0.0.1"
+                try:
+                    s.connect((connect_host, LOCAL_PROXY_PORT))
+                    proxy_ok = True
+                except Exception:
+                    if connect_host == "::1":
+                        s.close()
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.5)
+                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+                        proxy_ok = True
+                    else:
+                        raise
+            except Exception as e:
+                diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
+                proxy_err = diag[1] if diag else f"本地代理网关无法连通: {e}"
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            proxy_gateway_status = {
+                "name": "本地代理网关",
+                "status": "running" if proxy_ok else "stopped",
+                "details": f"监听地址: {LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+                "error": proxy_err
+            }
+            ovpn_ok = active_openvpn_running()
+            ovpn_err = ""
+            ovpn_details = "未连接"
+            if ovpn_ok:
+                ovpn_details = f"已连接节点: {active_openvpn_node_id}"
+                if sys.platform.startswith("linux"):
+                    if not Path("/sys/class/net/tun0").exists():
+                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
+            else:
+                if active_openvpn_node_id:
+                    ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
+                    ovpn_details = f"尝试连接节点 {active_openvpn_node_id} 失败"
+            openvpn_status = {
+                "name": "OpenVPN 核心连接",
+                "status": "running" if ovpn_ok else "stopped",
+                "details": ovpn_details,
+                "error": ovpn_err
+            }
+            now = time.time()
+            server_uptime = now - server_start_time
+            collector_ok = (last_collector_heartbeat > 0.0 and now - last_collector_heartbeat < (CHECK_INTERVAL_SECONDS * 1.5)) or (server_uptime < 15.0)
+            collector_status = {
+                "name": "节点同步守护线程",
+                "status": "running" if collector_ok else "stopped",
+                "details": f"上次心跳: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_collector_heartbeat)) if last_collector_heartbeat > 0 else '等待启动'}",
+                "error": "" if collector_ok else "线程可能已异常终止，导致无法在后台拉取和测速新节点。"
+            }
+            checker_ok = (last_checker_heartbeat > 0.0 and now - last_checker_heartbeat < 90.0) or (server_uptime < 35.0)
+            checker_status = {
+                "name": "出口检测守护线程",
+                "status": "running" if checker_ok else "stopped",
+                "details": f"上次心跳: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_checker_heartbeat)) if last_checker_heartbeat > 0 else '等待启动'}",
+                "error": "" if checker_ok else "线程可能已挂起或终止，导致无法实时获取代理出口状态。"
+            }
+            pinger_ok = (last_pinger_heartbeat > 0.0 and now - last_pinger_heartbeat < 30.0) or (server_uptime < 15.0)
+            pinger_status = {
+                "name": "延迟测速守护线程",
+                "status": "running" if pinger_ok else "stopped",
+                "details": f"上次心跳: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_pinger_heartbeat)) if last_pinger_heartbeat > 0 else '等待启动'}",
+                "error": "" if pinger_ok else "线程可能已中止，无法实时刷新活动节点的 Ping 延迟。"
+            }
+            self.send_json({
+                "ok": True,
+                "services": [
+                    web_ui_status,
+                    proxy_gateway_status,
+                    openvpn_status,
+                    collector_status,
+                    checker_status,
+                    pinger_status
+                ]
+            })
+        elif effective_path == "/api/logs":
+            logs_dir = DATA_DIR / "logs"
+            date_str = time.strftime("%Y-%m-%d", time.localtime())
+            log_file = logs_dir / f"{date_str}.json"
+            entries = []
+            if log_file.exists():
+                try:
+                    with lock:
+                        with open(log_file, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        entries.append(json.loads(line))
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    print(f"[API Logs] Error reading log file: {e}", flush=True)
+            self.send_json({"logs": entries})
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -3706,32 +4219,41 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return
 
-        if effective_path == "/api/update_settings":
+        if effective_path == "/api/update_credentials":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                new_username = str(payload.get("username") or "").strip()
+                new_password = str(payload.get("password") or "").strip()
+                
+                if not new_username or not new_password:
+                    self.send_json({"ok": False, "error": "用户名和密码不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                
+                ui_cfg = load_ui_config()
+                ui_cfg["username"] = new_username
+                ui_cfg["password"] = new_password
+                
+                auth_file = DATA_DIR / "ui_auth.json"
+                with lock:
+                    DATA_DIR.mkdir(exist_ok=True, parents=True)
+                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                
+                self.send_json({"ok": True, "message": "账号密码配置更新成功，已即时生效！"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/update_settings":
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 
-                curr_username = str(payload.get("curr_username") or "")
-                curr_password = str(payload.get("curr_password") or "")
-                
                 new_port = payload.get("port")
                 new_suffix = str(payload.get("secret_path") or "").strip()
-                new_username = str(payload.get("new_username") or "").strip()
-                new_password = str(payload.get("new_password") or "").strip()
-                
-                if not curr_username or not curr_password:
-                    self.send_json({"ok": False, "error": "请输入当前账号和密码进行安全验证"}, HTTPStatus.FORBIDDEN)
-                    return
-                
-                ui_cfg = load_ui_config()
-                expected_uname = ui_cfg.get("username", "admin")
-                expected_pwd = ui_cfg.get("password", "")
-                expected_port = ui_cfg.get("port", 8787)
-                expected_suffix = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
-                
-                if curr_username != expected_uname or curr_password != expected_pwd:
-                    self.send_json({"ok": False, "error": "当前账号或密码不正确"}, HTTPStatus.FORBIDDEN)
-                    return
+                new_proxy_port = payload.get("proxy_port")
+                routing_mode = str(payload.get("routing_mode") or "auto").strip()
+                force_country = str(payload.get("force_country") or "").strip()
                 
                 try:
                     new_port_int = int(new_port)
@@ -3741,25 +4263,45 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "端口范围必须是 1 至 65535"}, HTTPStatus.BAD_REQUEST)
                     return
                 
+                try:
+                    new_proxy_port_int = int(new_proxy_port)
+                    if not (1024 <= new_proxy_port_int <= 65535):
+                        raise ValueError()
+                except (TypeError, ValueError):
+                    self.send_json({"ok": False, "error": "代理出站端口范围必须是 1024 至 65535"}, HTTPStatus.BAD_REQUEST)
+                    return
+                
+                if new_proxy_port_int == new_port_int:
+                    self.send_json({"ok": False, "error": "代理出站端口不能与网页管理端口相同"}, HTTPStatus.BAD_REQUEST)
+                    return
+                
                 if not new_suffix or not re.match(r"^[A-Za-z0-9]+$", new_suffix):
                     self.send_json({"ok": False, "error": "安全后缀仅能由英文字母和数字组成"}, HTTPStatus.BAD_REQUEST)
                     return
                 
+                if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
+                    self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
+                    return
+                
+                ui_cfg = load_ui_config()
+                expected_port = ui_cfg.get("port", 8787)
+                expected_suffix = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+                expected_proxy_port = ui_cfg.get("proxy_port", 7928)
+                
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
-                if new_username:
-                    ui_cfg["username"] = new_username
-                if new_password:
-                    ui_cfg["password"] = new_password
+                ui_cfg["proxy_port"] = new_proxy_port_int
+                ui_cfg["routing_mode"] = routing_mode
+                ui_cfg["force_country"] = force_country
                 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
-                restart_needed = (new_port_int != expected_port or new_suffix != expected_suffix)
+                restart_needed = (new_port_int != expected_port or new_suffix != expected_suffix or new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
-                    self.send_json({"ok": True, "restart_needed": True, "message": "配置更新成功，系统及网页路径变更，将在 2 秒内重启..."})
+                    self.send_json({"ok": True, "restart_needed": True, "message": "配置更新成功，系统及网页端口或后缀变更，将在 2 秒内重启..."})
                     
                     def restart_server():
                         time.sleep(2)
@@ -3930,9 +4472,22 @@ def main() -> None:
             connect_host = LOCAL_PROXY_HOST
             if connect_host in ("::", "0.0.0.0", ""):
                 connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            s.connect((connect_host, LOCAL_PROXY_PORT))
-            gateway_ready = True
-            break
+            try:
+                s.connect((connect_host, LOCAL_PROXY_PORT))
+                gateway_ready = True
+                break
+            except Exception:
+                if connect_host == "::1":
+                    try:
+                        s.close()
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.5)
+                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+                        gateway_ready = True
+                        break
+                    except Exception:
+                        pass
+                raise
         except Exception:
             time.sleep(0.5)
         finally:
