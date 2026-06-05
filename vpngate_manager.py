@@ -735,24 +735,25 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
 
     lines: queue.Queue[str | None] = queue.Queue()
     startup_done = [False]
+    openvpn_logs: list[str] = []
 
     def reader() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             line_str = line.rstrip()
-            level = "INFO"
-            line_lower = line_str.lower()
-            if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
-                level = "ERROR"
-            elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
-                level = "WARNING"
-            log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
-            
             if not startup_done[0]:
+                openvpn_logs.append(line_str)
                 lines.put(line_str)
             else:
                 if keep_alive:
                     print(f"[OpenVPN] {line_str}", flush=True)
+                    level = "INFO"
+                    line_lower = line_str.lower()
+                    if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+                        level = "ERROR"
+                    elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
+                        level = "WARNING"
+                    log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
         if not startup_done[0]:
             lines.put(None)
 
@@ -790,6 +791,16 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             break
     else:
         message = f"OpenVPN timeout after {limit}s."
+
+    # Bulk write accumulated startup logs
+    for line_str in openvpn_logs:
+        level = "INFO"
+        line_lower = line_str.lower()
+        if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+            level = "ERROR"
+        elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
+            level = "WARNING"
+        log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     if not ok:
         err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
