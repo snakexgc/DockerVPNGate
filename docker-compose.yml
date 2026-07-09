@@ -1,0 +1,32 @@
+name: dockervpngate
+
+services:
+  dockervpngate:
+    image: dockervpngate:local
+    build:
+      context: .
+    container_name: DockerVPNGate
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv4.conf.default.rp_filter: "2"
+    environment:
+      VPNGATE_DATA_DIR: /var/lib/dockervpngate
+      UI_HOST: 0.0.0.0
+      LOCAL_PROXY_HOST: 0.0.0.0
+    ports:
+      - "8787:8787/tcp"
+      - "127.0.0.1:7928:7928/tcp"
+      - "127.0.0.1:7929:7929/tcp"
+      - "127.0.0.1:7930:7930/tcp"
+      - "127.0.0.1:7931:7931/tcp"
+      - "127.0.0.1:7932:7932/tcp"
+    volumes:
+      - ./vpngate_data:/var/lib/dockervpngate
+    stop_grace_period: 15s

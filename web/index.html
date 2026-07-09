@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DockerVPNGate 多出口管理</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><div class="brand-mark">D</div><div><strong>DockerVPNGate</strong><small>Multi Exit Gateway</small></div></div>
+    <button class="nav-button active" data-screen="system"><span class="nav-icon">◫</span>系统状态</button>
+    <button class="nav-button" data-screen="nodes"><span class="nav-icon">◎</span>节点配置<span class="nav-count" id="nav-node-count">0</span></button>
+    <div class="subnav" id="slot-nav"></div>
+    <button class="nav-button" data-screen="settings"><span class="nav-icon">⚙</span>设置</button>
+    <div class="side-footer">
+      <div class="side-health">已连接 <strong id="side-connected">0 / 5</strong></div>
+      <button class="nav-button logout" id="logout"><span class="nav-icon">↪</span>退出登录</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <header class="topbar">
+      <div style="display:flex;gap:12px;align-items:flex-start"><button class="btn mobile-menu" id="mobile-menu">☰</button><div><h1 id="page-title">系统状态</h1><p id="page-subtitle">代理出口的实时运行状态</p></div></div>
+      <div class="top-actions"><button class="btn btn-primary settings-save-action" id="save-settings" type="button">保存设置</button><button class="btn btn-danger traffic-reset-action" id="reset-traffic" type="button">清除数据</button><button class="btn" id="reload">刷新</button></div>
+    </header>
+
+    <section class="screen active" id="screen-system">
+      <div class="summary-grid">
+        <div class="summary"><label>在线代理</label><strong id="sum-online">0 / 5</strong></div>
+        <div class="summary"><label>可用节点</label><strong id="sum-nodes">0</strong></div>
+        <div class="summary"><label>总代理流量</label><div class="traffic-bubbles"><span class="traffic-bubble down" id="sum-download-rate">↓ 0 B/s</span><span class="traffic-bubble up" id="sum-upload-rate">↑ 0 B/s</span><span class="traffic-bubble total" id="sum-traffic-total">总流量 0 B</span></div></div>
+        <div class="summary"><label>服务运行时间</label><strong id="sum-uptime">0m</strong></div>
+      </div>
+      <div class="proxy-grid" id="proxy-grid"></div>
+    </section>
+
+    <section class="screen" id="screen-nodes">
+      <div class="node-kpis">
+        <div class="node-kpi"><span>缓存池节点</span><strong id="all-node-total">0 / 150</strong></div>
+        <div class="node-kpi"><span>当前可用</span><strong id="all-node-available">0</strong></div>
+        <div class="node-kpi"><span>覆盖国家/地区</span><strong id="all-node-countries">0</strong></div>
+        <div class="node-kpi"><span>已分配代理</span><strong id="all-node-active">0 / 5</strong></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div><h2>VPNGate 节点仓库</h2><div class="node-source" id="node-source-message">节点池节点列表</div></div>
+          <div class="toolbar"><button class="btn" id="test-cache-nodes">连接测试</button><button class="btn btn-primary" id="refresh-all-nodes">更新节点</button></div>
+        </div>
+        <div class="panel-body" style="padding-bottom:12px">
+          <div class="toolbar">
+            <input class="input" id="all-node-search" placeholder="搜索国家、IP、节点 ID、运营商">
+            <select class="input" id="all-node-country" style="width:170px"><option value="all">全部地区</option></select>
+            <select class="input" id="all-node-type" style="width:150px"><option value="all">全部IP类型</option><option value="residential">住宅 / 移动</option><option value="hosting">数据中心</option></select>
+            <select class="input" id="all-node-status" style="width:145px"><option value="all">全部状态</option><option value="available">可用</option><option value="queued">排队中</option><option value="testing">检测中</option><option value="unavailable">不可用</option></select>
+            <span class="muted" id="all-node-result-count" style="margin-left:auto"></span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table style="min-width:1180px">
+            <thead><tr><th>国家/地区</th><th>节点地址</th><th>最近拉取</th><th>协议</th><th>IP 类型</th><th>官方 Ping</th><th>实测延迟</th><th>上次检测</th><th>会话</th><th>线路评分</th><th>运营商</th><th>状态 / 分配</th></tr></thead>
+            <tbody id="all-node-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-proxy">
+      <div class="panel">
+        <div class="panel-head"><h2 id="proxy-heading">代理 1 配置</h2><div class="toolbar"><button class="btn btn-sm" id="test-proxy">检测出口</button><button class="btn btn-danger btn-sm" id="disconnect-proxy">断开</button></div></div>
+        <div class="panel-body">
+          <div class="form-grid">
+            <div class="field"><label>优先国家/地区</label><select class="input" id="preferred-country"><option value="">自动选择</option></select></div>
+            <div class="field"><label>出口 IP 类型</label><select class="input" id="routing-ip-type"><option value="all">全部</option><option value="residential">住宅 / 移动</option><option value="hosting">数据中心</option></select></div>
+            <div class="field"><label>节点失效策略</label><div class="mode-toggle"><label><input type="radio" name="switch-mode" value="auto" checked><span>自动切换</span></label><label><input type="radio" name="switch-mode" value="fixed"><span>固定选中</span></label></div></div>
+            <div class="field"><label>自动保持连接</label><div class="switch-row"><input type="checkbox" id="slot-enabled" checked><span>启用此代理端口</span></div></div>
+          </div>
+          <div class="toolbar" style="margin-top:15px"><button class="btn btn-primary" id="save-slot">保存并应用</button><span class="muted" id="slot-hint"></span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>节点列表</h2><div class="toolbar"><input class="input" id="node-search" placeholder="搜索国家、IP、运营商"><select class="input" id="node-country" style="width:170px"><option value="all">全部地区</option></select><select class="input" id="node-ip-type" style="width:155px"><option value="all">全部 IP 类型</option><option value="residential">住宅 / 移动</option><option value="hosting">数据中心</option></select><select class="input" id="node-status" style="width:145px"><option value="all">全部状态</option><option value="available">可用</option><option value="queued">排队中</option><option value="testing">检测中</option><option value="unavailable">不可用</option></select><button class="btn" id="refresh-nodes">更新节点</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th>地区</th><th>节点地址</th><th>IP 类型</th><th>延迟</th><th>上次检测</th><th>状态</th><th>占用</th><th>操作</th></tr></thead><tbody id="node-body"></tbody></table></div>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-settings">
+      <div class="notice">Docker容器端口请通过修改Docker Compose启动文件实现</div>
+      <div class="settings-grid">
+        <div class="panel"><div class="panel-head"><h2>用户管理</h2></div><div class="panel-body">
+          <div class="field"><label>用户名</label><input class="input" id="admin-username" autocomplete="username"></div>
+          <div class="field" style="margin-top:14px"><label>原密码</label><input class="input" type="password" id="current-admin-password" autocomplete="current-password" placeholder="修改用户信息时必填"></div>
+          <div class="field" style="margin-top:14px"><label>新密码</label><input class="input" type="password" id="admin-password" autocomplete="new-password" placeholder="留空保持不变"></div>
+          <div class="field" style="margin-top:14px"><label>再次输入新密码</label><input class="input" type="password" id="admin-password-confirm" autocomplete="new-password" placeholder="留空保持不变"></div>
+          <div class="field" style="margin-top:14px"><label>安全访问路径</label><input class="input mono" id="secret-path"></div>
+          <div class="field-hint">修改用户名、新密码或安全路径前，需要输入原密码。</div>
+        </div></div>
+        <div class="panel"><div class="panel-head"><h2>共享代理认证</h2></div><div class="panel-body">
+          <p class="muted" style="font-size:12px;margin-top:0">用户名和密码都留空则关闭认证。</p>
+          <div class="field"><label>代理用户名</label><div class="input-row"><input class="input mono" type="password" id="proxy-username" autocomplete="off"><button class="icon-btn" type="button" data-toggle-secret="proxy-username" title="显示/隐藏">👁</button><button class="icon-btn" type="button" data-copy-secret="proxy-username" title="复制">⧉</button></div></div>
+          <div class="field" style="margin-top:14px"><label>代理密码</label><div class="input-row"><input class="input mono" type="password" id="proxy-password" autocomplete="new-password"><button class="icon-btn" type="button" data-toggle-secret="proxy-password" title="显示/隐藏">👁</button><button class="icon-btn" type="button" data-copy-secret="proxy-password" title="复制">⧉</button></div><div class="field-hint">密码会从已保存配置中读取；清空用户名和密码后保存可关闭代理认证。</div></div>
+        </div></div>
+        <div class="panel"><div class="panel-head"><h2>节点缓存池</h2></div><div class="panel-body">
+          <div class="field"><label>缓存池大小(不建议过大)</label><input class="input" type="number" min="5" max="1000" step="1" id="node-cache-size" value="150"></div>
+          <div class="muted" id="node-cache-status" style="font-size:12px;margin-top:10px">当前占用 0 / 150</div>
+        </div></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

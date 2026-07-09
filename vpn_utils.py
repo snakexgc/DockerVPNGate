@@ -19,6 +19,8 @@ IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 ip_cache_lock = threading.RLock()
 
 COUNTRY_TRANSLATIONS = {
+    "European Union": "欧盟",
+    "EU": "欧盟",
     "Japan": "日本",
     "Korea Republic of": "韩国",
     "Korea": "韩国",

@@ -1,5 +1,5 @@
 # ============================================
-#  AimiliVPN .gitignore
+#  dockervpngate .gitignore
 # ============================================
 
 # ---- Nuitka 编译产物 ----
@@ -7,11 +7,11 @@ vpngate_manager.build/
 vpngate_manager.dist/
 *.build/
 *.dist/
-aimilivpn
+dockervpngate
 
 # ---- Debian 打包产物 ----
 *.deb
-aimilivpn_*
+dockervpngate_*
 
 # ---- Python 缓存 ----
 __pycache__/
@@ -52,12 +52,14 @@ logs/
 # ---- 本地开发文档（不上传 GitHub） ----
 AI开发指令.md
 功能文档.md
-AimiliVPN_Analysis_ZH.md
+dockervpngate_Analysis_ZH.md
 
 # ---- 临时和测试文件 ----
 scratch/
 *连接配置*
 test_*.py
+!tests/
+!tests/test_*.py
 *.bak
 *.orig
 
