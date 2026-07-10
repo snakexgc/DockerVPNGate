@@ -31,7 +31,13 @@ function formatBytes(bytes) {
 function formatRate(bytes) { return `${formatBytes(bytes)}/s`; }
 function fetchTime(timestamp) { const value=Number(timestamp)||0; return value ? new Date(value*1000).toLocaleString("zh-CN",{hour12:false}) : "-"; }
 function statusText(status) { return ({connected:"已连接",connecting:"连接中",degraded:"异常",disconnected:"未连接",disabled:"已停用"})[status]||status; }
-function countryLabel(value) { if(!value)return "自动"; return dashboard?.countries?.find(c=>c.value===value)?.label || value; }
+function countryChoice(value) {
+  if(!value)return null;
+  return dashboard?.countries?.find(country=>country.value===value || (country.aliases||[]).includes(value)) || null;
+}
+function countryLabel(value) { if(!value)return "自动"; return countryChoice(value)?.label || value; }
+function countryValue(value) { if(!value)return ""; return countryChoice(value)?.value || value; }
+function nodeCountryValue(node) { return countryChoice(node?.country)?.value || node?.country_label || node?.country || ""; }
 function nodeStatusValue(status) { return status==="not_checked" || !status ? "queued" : status; }
 function probeText(status) { return ({available:"可用",unavailable:"不可用",testing:"检测中",queued:"排队中",not_checked:"排队中"})[status]||status||"排队中"; }
 function ipTypeText(type) { return ({residential:"住宅",mobile:"移动",hosting:"数据中心"})[type]||type||"未知"; }
@@ -50,7 +56,7 @@ function refreshMarquees(root=document) {
     item.style.setProperty("--marquee-duration", `${Math.max(7, Math.min(18, overflow/18+7))}s`);
   }));
 }
-function activeElementId() { return document.activeElement?.id || ""; }
+function activeElementId() { return document.activeElement?.dataset?.selectId || document.activeElement?.id || ""; }
 function settingsInputIds() { return ["current-admin-password","admin-username","admin-password","admin-password-confirm","secret-path","proxy-username","proxy-password","node-cache-size"]; }
 function isSettingsFormActive() { return settingsInputIds().includes(activeElementId()); }
 function isNodeFilterActive() { return ["node-search","node-country","node-ip-type","node-status","all-node-search","all-node-country","all-node-type","all-node-status"].includes(activeElementId()); }
@@ -150,7 +156,7 @@ function renderSystem() {
 }
 function isProxyFormActive() {
   const active=document.activeElement;
-  return !!active && (["preferred-country","routing-ip-type","slot-enabled"].includes(active.id) || active.name==="switch-mode");
+  return !!active && (["preferred-country","routing-ip-type","slot-enabled"].includes(activeElementId()) || active.name==="switch-mode");
 }
 function updateProxyReadonly() {
   const current=dashboard?.slots?.[currentSlot-1];
@@ -158,33 +164,49 @@ function updateProxyReadonly() {
   $("proxy-heading").textContent=`代理 ${currentSlot} 配置 · 内部端口 ${current.port}`;
   $("slot-hint").textContent=current.switch_mode==="fixed"?"固定节点失效后将保持断开，重新可用后只重连该节点。":current.using_fallback?"当前处于跨地区备用状态，发现首选地区节点后会自动切回。":"当前节点失效后会自动连接配置范围内实测延迟最低的节点。";
 }
+function setCountryOptions(select,baseValue,baseLabel,countries,requestedValue,preferNodeCounts=false) {
+  const requested=requestedValue===baseValue?baseValue:countryValue(requestedValue);
+  const choices=preferNodeCounts?[]:[...(countries||[])];
+  if(preferNodeCounts) {
+    (nodes||[]).forEach(node=>{
+      const known=countryChoice(node?.country);
+      const value=nodeCountryValue(node);
+      if(value&&!choices.some(country=>country.value===value))choices.push({...(known||{}),value,label:known?.label||node.country_label||countryLabel(value)});
+    });
+    choices.sort((a,b)=>String(a.label).localeCompare(String(b.label),"zh-CN"));
+  }
+  if(requested!==baseValue && !choices.some(country=>country.value===requested))choices.unshift({value:requested,label:countryLabel(requested)});
+  const counts=countryCountMap();
+  select.innerHTML=`<option value="${esc(baseValue)}">${esc(baseLabel)}</option>`+choices.map(country=>countryOptionMarkup(country,counts,preferNodeCounts)).join("");
+  select.value=Array.from(select.options).some(option=>option.value===requested)?requested:baseValue;
+  refreshSelect(select);
+}
 function fillProxyForm(force=false) {
   const current=dashboard?.slots?.[currentSlot-1];
   if(!current)return;
   updateProxyReadonly();
   if(!force && (proxyFormDirty || isProxyFormActive()))return;
   const select=$("preferred-country");
-  select.innerHTML='<option value="">自动选择</option>'+dashboard.countries.map(c=>`<option value="${esc(c.value)}">${esc(c.label)}</option>`).join("");
-  select.value=current.preferred_country||""; $("routing-ip-type").value=current.routing_ip_type||"all"; $("slot-enabled").checked=!!current.enabled;
+  setCountryOptions(select,"","自动选择",dashboard.countries,current.preferred_country||"");
+  $("routing-ip-type").value=current.routing_ip_type||"all"; $("slot-enabled").checked=!!current.enabled;
+  refreshSelect($("routing-ip-type"));
   const mode=document.querySelector(`[name="switch-mode"][value="${current.switch_mode||"auto"}"]`); if(mode)mode.checked=true;
   proxyFormDirty=false;
 }
-function fillProxyNodeFilters(reset=false) {
+function fillProxyNodeFilters(reset=false,preferNodeCounts=false) {
   const current=dashboard?.slots?.[currentSlot-1];
   if(!current)return;
   const countrySelect=$("node-country");
   const previousCountry=countrySelect.value||"all";
-  const preferred=current.preferred_country||"";
-  const countries=[...(dashboard.countries||[])];
-  if(preferred && !countries.some(country=>country.value===preferred))countries.unshift({value:preferred,label:countryLabel(preferred)});
-  countrySelect.innerHTML='<option value="all">全部地区</option>'+countries.map(country=>`<option value="${esc(country.value)}">${esc(country.label)}</option>`).join("");
+  const preferred=countryValue(current.preferred_country)||"";
   const requestedCountry=reset ? (preferred||"all") : previousCountry;
-  countrySelect.value=[...countrySelect.options].some(option=>option.value===requestedCountry)?requestedCountry:"all";
+  setCountryOptions(countrySelect,"all","全部地区",dashboard.countries,requestedCountry,preferNodeCounts);
   if(reset)$("node-ip-type").value=current.routing_ip_type||"all";
+  refreshSelect($("node-ip-type"));
 }
 function renderNodes() {
   const search=$("node-search").value.trim().toLowerCase(), country=$("node-country").value, type=$("node-ip-type").value, status=$("node-status").value;
-  const preferred=dashboard.slots[currentSlot-1].preferred_country;
+  const preferred=countryValue(dashboard.slots[currentSlot-1].preferred_country);
   const filtered=nodes.filter(node=>{
     const text=`${node.country_label||""} ${node.ip||""} ${node.remote_host||""} ${node.owner||""}`.toLowerCase();
     const countryMatch=country==="all" || node.country===country || (node.country_label||node.country)===countryLabel(country);
@@ -199,17 +221,26 @@ function renderNodes() {
   document.querySelectorAll("[data-test]").forEach(btn=>btn.onclick=()=>testNode(btn.dataset.test));
   refreshMarquees($("node-body"));
 }
-async function loadNodes() { const data=await api(`nodes?slot=${currentSlot}`); nodes=data.nodes; renderNodes(); }
+async function loadNodes() {
+  const data=await api(`nodes?slot=${currentSlot}`); nodes=data.nodes;
+  if(currentScreen==="proxy") {
+    const preferred=$("preferred-country");
+    setCountryOptions(preferred,"","自动选择",dashboard.countries,preferred.value,true);
+    fillProxyNodeFilters(false,true);
+  }
+  renderNodes();
+}
 function renderAllNodes() {
   const search=$("all-node-search").value.trim().toLowerCase();
   const country=$("all-node-country").value, type=$("all-node-type").value, status=$("all-node-status").value;
   const filtered=nodes.filter(node=>{
     const text=`${node.id||""} ${node.country_label||node.country||""} ${node.ip||""} ${node.remote_host||""} ${node.owner||""} ${node.as_name||""}`.toLowerCase();
     const typeMatch=type==="all" || (type==="residential" ? ["residential","mobile"].includes(node.ip_type) : node.ip_type===type);
-    return (!search||text.includes(search)) && (country==="all"||node.country===country) && typeMatch && (status==="all"||nodeStatusValue(node.probe_status)===status);
+    const countryMatch=country==="all" || node.country===country || (node.country_label||node.country)===countryLabel(country);
+    return (!search||text.includes(search)) && countryMatch && typeMatch && (status==="all"||nodeStatusValue(node.probe_status)===status);
   }).sort((a,b)=>(a.probe_status==="available"?0:1)-(b.probe_status==="available"?0:1)||(Number(a.latency_ms)||999999)-(Number(b.latency_ms)||999999)||(Number(b.score)||0)-(Number(a.score)||0));
   const available=nodes.filter(node=>node.probe_status==="available").length;
-  const countries=new Set(nodes.map(node=>node.country).filter(Boolean)).size;
+  const countries=new Set(nodes.map(node=>nodeCountryValue(node)).filter(Boolean)).size;
   const active=new Set(nodes.map(node=>node.active_proxy).filter(Boolean)).size;
   $("all-node-total").textContent=`${nodes.length} / ${dashboard?.node_cache_size||150}`; $("all-node-available").textContent=available; $("all-node-countries").textContent=countries; $("all-node-active").textContent=`${active} / 5`;
   $("all-node-result-count").textContent=`显示 ${filtered.length} / ${nodes.length} 个节点`;
@@ -230,8 +261,7 @@ function renderAllNodes() {
 async function loadAllNodes() {
   const data=await api("nodes?slot=1"); nodes=data.nodes;
   const select=$("all-node-country"), selected=select.value||"all";
-  select.innerHTML='<option value="all">全部地区</option>'+dashboard.countries.map(country=>`<option value="${esc(country.value)}">${esc(country.label)}</option>`).join("");
-  select.value=[...select.options].some(option=>option.value===selected)?selected:"all";
+  setCountryOptions(select,"all","全部地区",dashboard.countries,selected,true);
   renderAllNodes();
 }
 async function loadDashboard(quiet=false, options={}) {
@@ -397,6 +427,288 @@ async function saveSettings() {
   } catch(e){showToast(e.message,true);}
 }
 
+// ===== Custom dropdown widget (keeps native select values/events) =====
+let customSelectSerial = 0;
+const CUSTOM_SELECT_LABELS = {
+  "all-node-country":"节点地区筛选",
+  "all-node-type":"节点 IP 类型筛选",
+  "all-node-status":"节点状态筛选",
+  "node-country":"代理节点地区筛选",
+  "node-ip-type":"代理节点 IP 类型筛选",
+  "node-status":"代理节点状态筛选"
+};
+function countryCountMap() {
+  const map = {};
+  (nodes||[]).forEach(node=>{
+    const country=nodeCountryValue(node);
+    if(country)map[country]=(map[country]||0)+1;
+  });
+  return map;
+}
+function countryOptionMarkup(country,fallbackCounts={},preferFallback=false) {
+  const fallback=fallbackCounts[country.value]??0;
+  const count=Math.max(0,Math.trunc(Number(preferFallback?fallback:(country.count??fallback))||0));
+  return `<option value="${esc(country.value)}" data-count="${count}">${esc(country.label)}</option>`;
+}
+function selectParts(select) {
+  return {wrap:select.closest(".select"),trigger:select._customTrigger,menu:select._customMenu};
+}
+function enabledOptionIndexes(select) {
+  return Array.from(select.options).map((option,index)=>option.disabled?-1:index).filter(index=>index>=0);
+}
+function buildSelectMenu(select) {
+  const {menu}=selectParts(select);
+  if(!menu)return;
+  const fragment=document.createDocumentFragment();
+  Array.from(select.options).forEach((option,index)=>{
+    const item=document.createElement("button");
+    item.type="button";
+    item.id=`${menu.id}-option-${index}`;
+    item.className="select-option";
+    item.dataset.index=String(index);
+    item.dataset.value=option.value;
+    item.setAttribute("role","option");
+    item.setAttribute("aria-selected",index===select.selectedIndex?"true":"false");
+    item.disabled=option.disabled;
+    const label=document.createElement("span");
+    label.className="opt-label";
+    label.textContent=option.textContent;
+    item.appendChild(label);
+    if(option.hasAttribute("data-count")) {
+      const count=document.createElement("span");
+      count.className="opt-count";
+      count.textContent=`(${Math.max(0,Math.trunc(Number(option.dataset.count)||0))})`;
+      item.appendChild(count);
+    }
+    item.addEventListener("mousedown",event=>event.preventDefault());
+    item.addEventListener("mouseenter",()=>setActiveOption(select,index,false));
+    item.addEventListener("click",event=>{
+      event.stopPropagation();
+      chooseSelectOption(select,index);
+    });
+    fragment.appendChild(item);
+  });
+  menu.replaceChildren(fragment);
+}
+function syncTrigger(select) {
+  const {trigger,menu}=selectParts(select);
+  if(!trigger||!menu)return;
+  const option=select.options[select.selectedIndex];
+  const value=trigger.querySelector(".select-value");
+  value.textContent=option?.textContent||"";
+  value.classList.toggle("placeholder",!option);
+  trigger.disabled=select.disabled;
+  menu.querySelectorAll(".select-option").forEach((item,index)=>{
+    const selected=index===select.selectedIndex;
+    item.classList.toggle("selected",selected);
+    item.setAttribute("aria-selected",selected?"true":"false");
+  });
+}
+function setActiveOption(select,index,ensureVisible=true) {
+  const {trigger,menu}=selectParts(select);
+  if(!trigger||!menu||!select.options[index]||select.options[index].disabled)return;
+  select._activeOptionIndex=index;
+  const items=Array.from(menu.querySelectorAll(".select-option"));
+  items.forEach((item,itemIndex)=>item.classList.toggle("active",itemIndex===index));
+  const active=items[index];
+  if(active) {
+    trigger.setAttribute("aria-activedescendant",active.id);
+    if(ensureVisible)active.scrollIntoView({block:"nearest"});
+  }
+}
+function moveActiveOption(select,direction) {
+  const indexes=enabledOptionIndexes(select);
+  if(!indexes.length)return;
+  const current=indexes.indexOf(select._activeOptionIndex);
+  const next=current<0 ? (direction>0?0:indexes.length-1) : (current+direction+indexes.length)%indexes.length;
+  setActiveOption(select,indexes[next]);
+}
+function typeaheadActiveOption(select,key) {
+  clearTimeout(select._typeaheadTimer);
+  let query=`${select._typeaheadQuery||""}${key}`.toLocaleLowerCase();
+  const indexes=enabledOptionIndexes(select);
+  const current=Math.max(-1,indexes.indexOf(select._activeOptionIndex));
+  const ordered=indexes.slice(current+1).concat(indexes.slice(0,current+1));
+  const findMatch=value=>ordered.find(index=>String(select.options[index].textContent||"").trim().toLocaleLowerCase().startsWith(value));
+  let match=findMatch(query);
+  if(match===undefined&&query.length>1) {
+    query=key.toLocaleLowerCase();
+    match=findMatch(query);
+  }
+  select._typeaheadQuery=query;
+  select._typeaheadTimer=setTimeout(()=>{select._typeaheadQuery="";},650);
+  if(match===undefined)return false;
+  if(!select.closest(".select")?.classList.contains("open"))openSelect(select);
+  setActiveOption(select,match);
+  return true;
+}
+function chooseSelectOption(select,index) {
+  const option=select.options[index];
+  if(!option||option.disabled)return;
+  const changed=select.selectedIndex!==index;
+  select.selectedIndex=index;
+  if(changed) {
+    select.dispatchEvent(new Event("input",{bubbles:true}));
+    select.dispatchEvent(new Event("change",{bubbles:true}));
+  }
+  syncTrigger(select);
+  closeSelect(select);
+}
+function positionMenu(select) {
+  const {wrap,trigger,menu}=selectParts(select);
+  if(!wrap||!trigger||!menu)return;
+  const rect=trigger.getBoundingClientRect();
+  const gap=6, viewportPadding=8;
+  const viewportWidth=document.documentElement.clientWidth||window.innerWidth;
+  const viewportHeight=document.documentElement.clientHeight||window.innerHeight;
+  const width=Math.min(rect.width,Math.max(0,viewportWidth-viewportPadding*2));
+  const left=Math.min(Math.max(viewportPadding,rect.left),Math.max(viewportPadding,viewportWidth-viewportPadding-width));
+  menu.style.width=`${Math.round(width)}px`;
+  menu.style.maxHeight="280px";
+  const naturalHeight=Math.min(menu.scrollHeight+2,280);
+  const spaceBelow=Math.max(0,viewportHeight-rect.bottom-gap-viewportPadding);
+  const spaceAbove=Math.max(0,rect.top-gap-viewportPadding);
+  const openAbove=spaceBelow<naturalHeight && spaceAbove>spaceBelow;
+  const available=openAbove?spaceAbove:spaceBelow;
+  const maxHeight=Math.max(1,Math.min(280,available));
+  const menuHeight=Math.min(naturalHeight,maxHeight);
+  const top=openAbove ? Math.max(viewportPadding,rect.top-gap-menuHeight) : Math.min(rect.bottom+gap,viewportHeight-viewportPadding-menuHeight);
+  menu.style.left=`${Math.round(left)}px`;
+  menu.style.top=`${Math.round(Math.max(viewportPadding,top))}px`;
+  menu.style.maxHeight=`${Math.round(maxHeight)}px`;
+  wrap.classList.toggle("open-up",openAbove);
+  menu.classList.toggle("open-up",openAbove);
+}
+function closeSelect(select) {
+  const {wrap,trigger,menu}=selectParts(select);
+  if(!wrap)return;
+  wrap.classList.remove("open");
+  menu?.classList.remove("open");
+  trigger?.setAttribute("aria-expanded","false");
+  trigger?.removeAttribute("aria-activedescendant");
+  select._activeOptionIndex=-1;
+  clearTimeout(select._typeaheadTimer);
+  select._typeaheadQuery="";
+}
+function closeAllSelects(except=null) {
+  document.querySelectorAll(".select.open select").forEach(select=>{
+    if(select!==except)closeSelect(select);
+  });
+}
+function openSelect(select) {
+  const {wrap,trigger,menu}=selectParts(select);
+  if(!wrap||!trigger||!menu||select.disabled)return;
+  closeAllSelects(select);
+  buildSelectMenu(select);
+  syncTrigger(select);
+  positionMenu(select);
+  wrap.classList.add("open");
+  menu.classList.add("open");
+  trigger.setAttribute("aria-expanded","true");
+  const indexes=enabledOptionIndexes(select);
+  const active=select.options[select.selectedIndex]?.disabled ? indexes[0] : select.selectedIndex;
+  if(active>=0)setActiveOption(select,active);
+}
+function enhanceSelect(select) {
+  if(select.dataset.custom==="1")return;
+  select.dataset.custom="1";
+  select.classList.add("is-custom");
+  select.tabIndex=-1;
+  select.setAttribute("aria-hidden","true");
+  const wrap=document.createElement("div");
+  wrap.className="select";
+  if(select.style.width)wrap.style.width=select.style.width;
+  select.parentNode.insertBefore(wrap,select);
+  wrap.appendChild(select);
+  const serial=++customSelectSerial;
+  const trigger=document.createElement("button");
+  trigger.type="button";
+  trigger.id=select.id?`${select.id}-trigger`:`custom-select-${serial}-trigger`;
+  trigger.className="select-trigger";
+  trigger.dataset.selectId=select.id||"";
+  trigger.setAttribute("role","combobox");
+  trigger.setAttribute("aria-label",select.getAttribute("aria-label")||select.closest(".field")?.querySelector("label")?.textContent.trim()||CUSTOM_SELECT_LABELS[select.id]||"选择选项");
+  trigger.setAttribute("aria-haspopup","listbox");
+  trigger.setAttribute("aria-expanded","false");
+  const value=document.createElement("span");
+  value.className="select-value";
+  const arrow=document.createElement("span");
+  arrow.className="select-arrow";
+  arrow.setAttribute("aria-hidden","true");
+  trigger.append(value,arrow);
+  wrap.appendChild(trigger);
+  const menu=document.createElement("div");
+  menu.id=select.id?`${select.id}-menu`:`custom-select-${serial}-menu`;
+  menu.className="select-menu";
+  menu.setAttribute("role","listbox");
+  menu.setAttribute("aria-labelledby",trigger.id);
+  trigger.setAttribute("aria-controls",menu.id);
+  document.body.appendChild(menu);
+  select._customTrigger=trigger;
+  select._customMenu=menu;
+  select._activeOptionIndex=-1;
+  buildSelectMenu(select);
+  syncTrigger(select);
+  trigger.addEventListener("click",event=>{
+    event.stopPropagation();
+    wrap.classList.contains("open")?closeSelect(select):openSelect(select);
+  });
+  trigger.addEventListener("keydown",event=>{
+    if(event.key==="ArrowDown"||event.key==="ArrowUp") {
+      event.preventDefault();
+      if(!wrap.classList.contains("open"))openSelect(select);
+      else moveActiveOption(select,event.key==="ArrowDown"?1:-1);
+    } else if(event.key==="Home"||event.key==="End") {
+      if(!wrap.classList.contains("open"))return;
+      event.preventDefault();
+      const indexes=enabledOptionIndexes(select);
+      if(indexes.length)setActiveOption(select,event.key==="Home"?indexes[0]:indexes[indexes.length-1]);
+    } else if(event.key==="Enter"||event.key===" ") {
+      event.preventDefault();
+      if(wrap.classList.contains("open"))chooseSelectOption(select,select._activeOptionIndex);
+      else openSelect(select);
+    } else if(event.key==="Escape") {
+      if(wrap.classList.contains("open"))event.preventDefault();
+      closeSelect(select);
+    } else if(event.key==="Tab") {
+      closeSelect(select);
+    } else if(event.key.length===1&&!event.ctrlKey&&!event.metaKey&&!event.altKey) {
+      if(typeaheadActiveOption(select,event.key))event.preventDefault();
+    }
+  });
+  select.addEventListener("change",()=>syncTrigger(select));
+}
+function refreshSelect(select) {
+  const {wrap,menu}=selectParts(select);
+  if(!wrap){enhanceSelect(select);return;}
+  const activeValue=menu?.querySelector(".select-option.active")?.dataset.value;
+  buildSelectMenu(select);
+  syncTrigger(select);
+  if(wrap.classList.contains("open")) {
+    positionMenu(select);
+    const preserved=activeValue===undefined?-1:Array.from(select.options).findIndex(option=>option.value===activeValue&&!option.disabled);
+    const active=preserved>=0?preserved:(select.options[select.selectedIndex]?.disabled?enabledOptionIndexes(select)[0]:select.selectedIndex);
+    if(active>=0)setActiveOption(select,active);
+  }
+}
+function enhanceAllSelects() {
+  document.querySelectorAll("select.input").forEach(enhanceSelect);
+}
+document.addEventListener("click",event=>{
+  if(!event.target.closest?.(".select-menu"))closeAllSelects();
+});
+document.addEventListener("focusin",event=>{
+  document.querySelectorAll(".select.open select").forEach(select=>{
+    const {trigger,menu}=selectParts(select);
+    if(event.target!==trigger&&!menu?.contains(event.target))closeSelect(select);
+  });
+});
+window.addEventListener("scroll",event=>{
+  if(event.target?.closest?.(".select-menu"))return;
+  closeAllSelects();
+},true);
+window.addEventListener("resize",()=>closeAllSelects());
+
 document.querySelectorAll("[data-screen]").forEach(button=>button.onclick=()=>showScreen(button.dataset.screen));
 $("reload").onclick=async()=>{await loadDashboard(false,{forceForms:true});if(currentScreen==="nodes")await loadAllNodes();if(currentScreen==="proxy")await loadNodes();if(currentScreen==="settings")await loadSettingsSecrets(true);};
 $("save-slot").onclick=saveSlot; $("node-search").oninput=renderNodes; $("node-country").onchange=renderNodes; $("node-ip-type").onchange=renderNodes; $("node-status").onchange=renderNodes;
@@ -417,4 +729,5 @@ $("test-proxy").onclick=async()=>{try{const d=await api("slots/test",{method:"PO
 $("save-settings").onclick=saveSettings; $("mobile-menu").onclick=()=>$("sidebar").classList.toggle("open");
 $("reset-traffic").onclick=resetTraffic;
 $("logout").onclick=async()=>{try{await api("logout",{method:"POST",body:"{}"});}finally{location.reload();}};
+enhanceAllSelects();
 loadDashboard().then(()=>showScreen("system")); setInterval(()=>loadDashboard(true,{heartbeat:true}),5000); setInterval(()=>loadTraffic(),2000);

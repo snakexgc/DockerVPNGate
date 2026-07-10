@@ -88,6 +88,33 @@ class NodeStatusTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 7)
 
 
+class DashboardPayloadTests(unittest.TestCase):
+    def test_country_choices_include_counts_and_merge_translated_aliases(self) -> None:
+        canada = vpngate_manager.normalized_country_name("Canada")
+        choices = vpngate_manager.country_choice_payloads([
+            {"country": "Canada"},
+            {"country": canada},
+            {"country": "Japan"},
+            {"country": ""},
+            {},
+        ])
+
+        by_value = {choice["value"]: choice for choice in choices}
+        self.assertEqual(by_value[canada]["count"], 2)
+        self.assertEqual(sum(choice["count"] for choice in choices), 3)
+        if canada != "Canada":
+            self.assertEqual(by_value[canada]["aliases"], ["Canada"])
+
+    def test_country_choices_keep_known_alias_for_legacy_preference(self) -> None:
+        canada = vpngate_manager.normalized_country_name("Canada")
+        if canada == "Canada":
+            self.skipTest("Canada has no translated alias in this configuration")
+
+        choices = vpngate_manager.country_choice_payloads([{"country": canada}])
+
+        self.assertIn("Canada", choices[0]["aliases"])
+
+
 class NetworkIsolationTests(unittest.TestCase):
     def test_managed_openvpn_cannot_modify_container_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

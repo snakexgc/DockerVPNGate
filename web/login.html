@@ -4,29 +4,30 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DockerVPNGate - 安全登录</title>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-dark: #090d16;
-      --bg-surface: rgba(15, 23, 42, 0.45);
-      --border-color: rgba(255, 255, 255, 0.08);
-      --text-primary: #f8fafc;
-      --text-secondary: #94a3b8;
-      --primary: #6366f1;
-      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-      --primary-hover: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
-      --success: #10b981;
-      --danger: #f43f5e;
+      --bg: #eef1f7;
+      --bg-surface: #ffffff;
+      --border-color: rgba(15, 23, 42, 0.12);
+      --text-primary: #0f172a;
+      --text-secondary: rgba(15, 23, 42, 0.58);
+      --primary: #4f46e5;
+      --primary-2: #6366f1;
+      --primary-gradient: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+      --primary-hover: linear-gradient(135deg, #4338ca 0%, #4f46e5 100%);
+      --success: #16a34a;
+      --danger: #dc2626;
     }
 
     body {
       margin: 0;
       padding: 0;
-      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg-dark);
-      background-image: 
-        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
-        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background-color: var(--bg);
+      background-image:
+        radial-gradient(at 0% 0%, rgba(79, 70, 229, 0.10) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(124, 58, 237, 0.07) 0px, transparent 50%),
+        radial-gradient(at 60% 100%, rgba(22, 163, 74, 0.05) 0px, transparent 50%);
       height: 100vh;
       display: flex;
       align-items: center;
@@ -43,12 +44,10 @@
 
     .login-card {
       background: var(--bg-surface);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
       border: 1px solid var(--border-color);
       border-radius: 20px;
       padding: 40px 32px;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+      box-shadow: 0 20px 48px rgba(15, 23, 42, 0.12);
       text-align: center;
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
@@ -56,8 +55,8 @@
     .brand-logo {
       width: 64px;
       height: 64px;
-      background: rgba(99, 102, 241, 0.1);
-      border: 1px solid rgba(99, 102, 241, 0.25);
+      background: rgba(79, 70, 229, 0.1);
+      border: 1px solid rgba(79, 70, 229, 0.28);
       border-radius: 16px;
       display: flex;
       align-items: center;
@@ -88,7 +87,7 @@
       font-weight: 700;
       color: var(--text-primary);
       margin: 0 0 8px 0;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.3px;
     }
 
     .login-subtitle {
@@ -105,7 +104,7 @@
     .form-label {
       display: block;
       font-size: 13px;
-      font-weight: 500;
+      font-weight: 600;
       color: var(--text-secondary);
       margin-bottom: 8px;
       margin-left: 4px;
@@ -118,9 +117,9 @@
     .input-field {
       width: 100%;
       height: 48px;
-      background: rgba(255, 255, 255, 0.03);
+      background: #ffffff;
       border: 1px solid var(--border-color);
-      border-radius: 10px;
+      border-radius: 11px;
       padding: 0 16px;
       box-sizing: border-box;
       color: var(--text-primary);
@@ -132,8 +131,7 @@
 
     .input-field:focus {
       border-color: var(--primary);
-      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.6);
+      box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.14);
     }
 
     .error-message {
@@ -151,24 +149,24 @@
       height: 48px;
       background: var(--primary-gradient);
       border: none;
-      border-radius: 10px;
+      border-radius: 11px;
       color: white;
       font-family: inherit;
       font-size: 15px;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
       transition: all 0.2s ease;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+      box-shadow: 0 8px 18px rgba(79, 70, 229, 0.28);
     }
 
     .login-btn:hover {
       background: var(--primary-hover);
       transform: translateY(-1px);
-      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+      box-shadow: 0 10px 22px rgba(79, 70, 229, 0.34);
     }
 
     .login-btn:active {

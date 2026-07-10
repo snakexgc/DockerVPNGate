@@ -641,18 +641,41 @@ def proxy_slot_payload(index: int, nodes: list[dict[str, Any]], config: dict[str
     }
 
 
+def country_choice_payloads(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    known_aliases: dict[str, set[str]] = {}
+    for alias, translated in vpn_utils.COUNTRY_TRANSLATIONS.items():
+        label = normalized_country_name(translated)
+        if alias != label:
+            known_aliases.setdefault(label, set()).add(alias)
+    countries: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        country = str(node.get("country") or "").strip()
+        if country:
+            label = normalized_country_name(country)
+            choice = countries.setdefault(
+                label,
+                {"value": label, "label": label, "count": 0, "aliases": set(known_aliases.get(label, set()))},
+            )
+            choice["count"] += 1
+            if country != label:
+                choice["aliases"].add(country)
+    country_choices = []
+    for choice in sorted(countries.values(), key=lambda item: item["label"]):
+        if not choice["aliases"]:
+            choice.pop("aliases")
+        else:
+            choice["aliases"] = sorted(choice["aliases"])
+        country_choices.append(choice)
+    return country_choices
+
+
 def multi_dashboard_state() -> dict[str, Any]:
     nodes = read_nodes()
     config = load_ui_config()
     state = read_json(STATE_FILE, {})
-    countries: dict[str, str] = {}
-    for node in nodes:
-        country = str(node.get("country") or "").strip()
-        if country:
-            countries[country] = normalized_country_name(country)
     return {
         "slots": [proxy_slot_payload(index, nodes, config) for index in range(len(PROXY_PORTS))],
-        "countries": [{"value": key, "label": value} for key, value in sorted(countries.items(), key=lambda item: item[1])],
+        "countries": country_choice_payloads(nodes),
         "node_count": len(nodes),
         "node_cache_size": int(config.get("node_cache_size", DEFAULT_NODE_CACHE_SIZE)),
         "node_cache_count": len(nodes),
