@@ -20,6 +20,7 @@ from .config import (
     NODES_FILE, OPENVPN_TEST_TIMEOUT_SECONDS, PROXY_PORTS, STATE_FILE,
 )
 from .openvpn_runtime import run_openvpn_until_ready, stop_process
+from .policy_routing import cleanup_policy_routing, setup_policy_routing
 from .storage import read_json, read_nodes, write_json
 
 APP: ModuleType
@@ -209,49 +210,13 @@ latency_dns_cache: dict[str, Any] = {"ips": [], "expires_at": 0.0}
 
 
 def cleanup_test_policy_routing(interface: str, table: int) -> None:
-    try:
-        subprocess.run(
-            ["ip", "rule", "del", "oif", interface, "table", str(table)],
-            capture_output=True,
-            timeout=2,
-        )
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            ["ip", "route", "flush", "table", str(table)],
-            capture_output=True,
-            timeout=2,
-        )
-    except Exception:
-        pass
+    setup_priority = 21000 + (table - 1000)
+    cleanup_policy_routing(interface, table, setup_priority)
 
 
 def setup_test_policy_routing(interface: str, table: int) -> None:
-    cleanup_test_policy_routing(interface, table)
-    subprocess.run(
-        ["ip", "route", "add", "default", "dev", interface, "table", str(table)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    subprocess.run(
-        ["ip", "rule", "add", "oif", interface, "table", str(table)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    for target in ("all", "default", interface):
-        try:
-            subprocess.run(
-                ["sysctl", "-w", f"net.ipv4.conf.{target}.rp_filter=2"],
-                capture_output=True,
-                timeout=2,
-            )
-        except Exception:
-            pass
+    setup_priority = 21000 + (table - 1000)
+    setup_policy_routing(interface, table, setup_priority)
 
 
 def _parse_latency_curl_result(result: subprocess.CompletedProcess[str]) -> tuple[bool, int, str]:

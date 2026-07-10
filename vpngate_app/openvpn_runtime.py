@@ -138,17 +138,35 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         pass
 
     if route_nopull:
-        command.append("--route-nopull")
+        # This application routes only sockets explicitly bound to the TUN
+        # device through a dedicated policy table. route-nopull blocks routes
+        # pushed by the server, while route-noexec also blocks route directives
+        # embedded in a downloaded .ovpn file. Without both, one unusual node
+        # can replace the container's main/default route and take the API and
+        # every other node offline.
+        command.extend(["--route-nopull", "--route-noexec"])
     return command
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    process.terminate()
     try:
-        process.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        process.kill()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+    finally:
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
 def kill_existing_openvpn_processes() -> None:
     if not sys.platform.startswith("linux"):

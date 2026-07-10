@@ -102,6 +102,7 @@ from vpngate_app.openvpn_runtime import (
     configure_state_writer as configure_openvpn_state_writer,
     ensure_dirs, kill_existing_openvpn_processes, run_openvpn_until_ready, stop_process,
 )
+from vpngate_app.policy_routing import cleanup_policy_routing, setup_policy_routing
 from vpngate_app.common import parse_int, safe_name
 from vpngate_app.vpngate_source import (
     cached_nodes, configure_state_writer, fetch_api_text, fetch_candidates,
@@ -225,28 +226,14 @@ def slot_process_running(index: int) -> bool:
 
 def cleanup_slot_policy_routing(index: int) -> None:
     interface = PROXY_INTERFACES[index]
-    table = str(100 + index)
-    try:
-        subprocess.run(["ip", "rule", "del", "oif", interface, "table", table], capture_output=True, timeout=2)
-    except Exception:
-        pass
-    try:
-        subprocess.run(["ip", "route", "flush", "table", table], capture_output=True, timeout=2)
-    except Exception:
-        pass
+    table = 100 + index
+    cleanup_policy_routing(interface, table, 20000 + index)
 
 
 def setup_slot_policy_routing(index: int) -> None:
     interface = PROXY_INTERFACES[index]
-    table = str(100 + index)
-    cleanup_slot_policy_routing(index)
-    subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", table], check=True, timeout=3)
-    subprocess.run(["ip", "rule", "add", "oif", interface, "table", table], check=True, timeout=3)
-    for target in ("all", "default", interface):
-        try:
-            subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{target}.rp_filter=2"], capture_output=True, timeout=2)
-        except Exception:
-            pass
+    table = 100 + index
+    setup_policy_routing(interface, table, 20000 + index)
 
 
 def _stop_proxy_slot_locked(index: int, reason: str = "") -> None:

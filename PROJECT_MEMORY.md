@@ -29,6 +29,7 @@
 | `vpngate_app/storage.py` | 原子 JSON 读写、管理配置迁移、代理槽默认值和节点读取。 |
 | `vpngate_app/vpngate_source.py` | VPNGate API 获取、上游代理握手、CSV/配置解析、节点转换与黑名单。 |
 | `vpngate_app/openvpn_runtime.py` | OpenVPN 命令构建、进程启动/终止、残留清理与握手等待。 |
+| `vpngate_app/policy_routing.py` | 为绑定到 `tunX` 的 socket 建立独立策略路由表，并以固定优先级可靠清理规则。 |
 | `vpngate_app/node_testing.py` | 临时测试隧道、Google 204 延时检测、8 线程队列与取消恢复。 |
 | `vpngate_app/traffic.py` | `tun0`–`tun4` 每秒采样、今日/累计流量与原子清零。 |
 | `vpngate_app/web_api.py` | 登录会话、静态资源和 REST API 路由。通过入口模块注入运行时服务。 |
@@ -67,6 +68,7 @@
 - `connect_proxy_slot()` 在槽锁和 VPN 操作锁内停止旧隧道、建立新隧道、设置策略路由并保存节点选择。
 - 每个槽只能占用一个节点，一个节点不能被多个槽同时使用。
 - 停止隧道前必须采样一次流量，避免节点切换丢失最后一段统计。
+- 所有受管 OpenVPN 进程必须同时使用 `route-nopull` 与 `route-noexec`，不得修改容器主路由；只有显式绑定到 `tunX` 的代理 socket 才能通过独立策略表进入隧道。
 
 ### 流量统计
 

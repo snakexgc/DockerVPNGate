@@ -3,15 +3,18 @@ from __future__ import annotations
 import threading
 import time
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 import unittest
+from pathlib import Path
 from http.server import HTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from vpngate_app.config import PROXY_INTERFACES, PROXY_PORTS
 from vpngate_app import node_testing
+from vpngate_app import openvpn_runtime, policy_routing
 from vpngate_app.node_testing import (
     NODE_STATUS_AVAILABLE, NODE_STATUS_QUEUED, NODE_STATUS_TESTING,
     NODE_STATUS_UNAVAILABLE, sort_all_nodes,
@@ -83,6 +86,53 @@ class NodeStatusTests(unittest.TestCase):
         self.assertEqual(command[command.index("--connect-timeout") + 1], "5")
         self.assertEqual(command[command.index("--max-time") + 1], "5")
         self.assertEqual(captured["timeout"], 7)
+
+
+class NetworkIsolationTests(unittest.TestCase):
+    def test_managed_openvpn_cannot_modify_container_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "node.ovpn"
+            config_path.write_text(
+                "client\nproto udp\nremote 192.0.2.10 1194\nredirect-gateway def1\n",
+                encoding="utf-8",
+            )
+            with patch.object(openvpn_runtime, "get_openvpn_version", return_value=2.6):
+                command = openvpn_runtime.openvpn_command(str(config_path), True, "tun10")
+
+        self.assertIn("--route-nopull", command)
+        self.assertIn("--route-noexec", command)
+
+    def test_unisolated_openvpn_command_does_not_force_route_noexec(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "node.ovpn"
+            config_path.write_text("client\nproto udp\nremote 192.0.2.10 1194\n", encoding="utf-8")
+            with patch.object(openvpn_runtime, "get_openvpn_version", return_value=2.6):
+                command = openvpn_runtime.openvpn_command(str(config_path), False, "tun10")
+
+        self.assertNotIn("--route-nopull", command)
+        self.assertNotIn("--route-noexec", command)
+
+    def test_policy_rule_has_stable_cleanup_priority(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                1 if command[:3] == ["ip", "rule", "del"] else 0,
+                stdout="",
+                stderr="",
+            )
+
+        with patch.object(policy_routing.subprocess, "run", side_effect=fake_run):
+            policy_routing.setup_policy_routing("tun10", 1010, 21010)
+            policy_routing.cleanup_policy_routing("tun10", 1010, 21010)
+
+        self.assertIn(
+            ["ip", "rule", "add", "priority", "21010", "oif", "tun10", "table", "1010"],
+            commands,
+        )
+        self.assertIn(["ip", "rule", "del", "priority", "21010"], commands)
 
 
 class WebRoutingTests(unittest.TestCase):
