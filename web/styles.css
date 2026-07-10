@@ -317,8 +317,8 @@ button,
   gap: 10px;
 }
 
-.settings-save-action,
-.traffic-reset-action {
+.btn.settings-save-action,
+.btn.traffic-reset-action {
   display: none;
 }
 
