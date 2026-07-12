@@ -13,6 +13,7 @@
     <button class="nav-button active" data-screen="system"><span class="nav-icon">◫</span>系统状态</button>
     <button class="nav-button" data-screen="nodes"><span class="nav-icon">◎</span>节点配置<span class="nav-count" id="nav-node-count">0</span></button>
     <div class="subnav" id="slot-nav"></div>
+    <button class="nav-button" data-screen="logs"><span class="nav-icon">≡</span>运行日志</button>
     <button class="nav-button" data-screen="settings"><span class="nav-icon">⚙</span>设置</button>
     <div class="side-footer">
       <div class="side-health">已连接 <strong id="side-connected">0 / 5</strong></div>
@@ -38,10 +39,19 @@
 
     <section class="screen" id="screen-nodes">
       <div class="node-kpis">
-        <div class="node-kpi"><span>缓存池节点</span><strong id="all-node-total">0 / 150</strong></div>
+        <div class="node-kpi"><span>缓存池节点</span><strong id="all-node-total">0 / 0</strong></div>
         <div class="node-kpi"><span>当前可用</span><strong id="all-node-available">0</strong></div>
         <div class="node-kpi"><span>覆盖国家/地区</span><strong id="all-node-countries">0</strong></div>
         <div class="node-kpi"><span>已分配代理</span><strong id="all-node-active">0 / 5</strong></div>
+      </div>
+      <div class="region-overview panel">
+        <div class="region-overview-head">
+          <div><h2>节点池地区分布</h2><div class="muted">按国家/地区汇总当前节点池的可用情况</div></div>
+          <span class="muted" id="region-overview-summary">0 个地区</span>
+        </div>
+        <div class="region-grid" id="region-overview-grid">
+          <div class="region-empty">节点池中暂无地区数据</div>
+        </div>
       </div>
       <div class="panel">
         <div class="panel-head">
@@ -58,7 +68,7 @@
           </div>
         </div>
         <div class="table-wrap">
-          <table style="min-width:1180px">
+          <table class="resizable-table">
             <thead><tr><th>国家/地区</th><th>节点地址</th><th>最近拉取</th><th>协议</th><th>IP 类型</th><th>官方 Ping</th><th>实测延迟</th><th>上次检测</th><th>会话</th><th>线路评分</th><th>运营商</th><th>状态 / 分配</th></tr></thead>
             <tbody id="all-node-body"></tbody>
           </table>
@@ -80,8 +90,23 @@
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>节点列表</h2><div class="toolbar"><input class="input" id="node-search" placeholder="搜索国家、IP、运营商"><select class="input" id="node-country" style="width:170px"><option value="all">全部地区</option></select><select class="input" id="node-ip-type" style="width:155px"><option value="all">全部 IP 类型</option><option value="residential">住宅 / 移动</option><option value="hosting">数据中心</option></select><select class="input" id="node-status" style="width:145px"><option value="all">全部状态</option><option value="available">可用</option><option value="queued">排队中</option><option value="testing">检测中</option><option value="unavailable">不可用</option></select><button class="btn" id="refresh-nodes">更新节点</button></div></div>
-        <div class="table-wrap"><table><thead><tr><th>地区</th><th>节点地址</th><th>IP 类型</th><th>延迟</th><th>上次检测</th><th>状态</th><th>占用</th><th>操作</th></tr></thead><tbody id="node-body"></tbody></table></div>
+        <div class="panel-head"><div><h2>节点列表</h2><div class="muted" id="node-filter-summary">跟随上方代理配置筛选</div></div><div class="toolbar"><input class="input" id="node-search" placeholder="搜索国家、IP、运营商"><select class="input" id="node-status" style="width:145px"><option value="all">全部状态</option><option value="available">可用</option><option value="queued">排队中</option><option value="testing">检测中</option><option value="unavailable">不可用</option></select><button class="btn" id="refresh-nodes">更新节点</button></div></div>
+        <div class="table-wrap"><table class="resizable-table"><thead><tr><th>地区</th><th>节点地址</th><th>IP 类型</th><th>延迟</th><th>上次检测</th><th>状态</th><th>占用</th><th>操作</th></tr></thead><tbody id="node-body"></tbody></table></div>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-logs">
+      <div class="panel log-panel">
+        <div class="panel-head">
+          <div><h2>运行日志</h2><div class="muted">集中显示系统、节点池、OpenVPN 与代理运行事件</div></div>
+          <div class="toolbar"><label class="switch-row"><input type="checkbox" id="log-auto-refresh" checked><span>自动刷新</span></label><button class="btn" id="refresh-logs">刷新</button></div>
+        </div>
+        <div class="panel-body log-filters">
+          <select class="input" id="log-level" style="width:150px"><option value="">全部级别</option><option value="INFO">信息</option><option value="WARNING">警告</option><option value="ERROR">错误</option></select>
+          <input class="input" id="log-search" placeholder="搜索模块、线程或消息">
+          <span class="muted" id="log-count">0 条日志</span>
+        </div>
+        <div class="log-list" id="log-list"><div class="empty">正在载入日志…</div></div>
       </div>
     </section>
 
@@ -102,8 +127,9 @@
           <div class="field" style="margin-top:14px"><label>代理密码</label><div class="input-row"><input class="input mono" type="password" id="proxy-password" autocomplete="new-password"><button class="icon-btn" type="button" data-toggle-secret="proxy-password" title="显示/隐藏">👁</button><button class="icon-btn" type="button" data-copy-secret="proxy-password" title="复制">⧉</button></div><div class="field-hint">密码会从已保存配置中读取；清空用户名和密码后保存可关闭代理认证。</div></div>
         </div></div>
         <div class="panel"><div class="panel-head"><h2>节点缓存池</h2></div><div class="panel-body">
-          <div class="field"><label>缓存池大小(不建议过大)</label><input class="input" type="number" min="5" max="1000" step="1" id="node-cache-size" value="150"></div>
-          <div class="muted" id="node-cache-status" style="font-size:12px;margin-top:10px">当前占用 0 / 150</div>
+          <div class="field"><label>每个国家/地区的最大节点数</label><input class="input" type="number" min="1" max="200" step="1" id="region-node-limit" value="10"></div>
+          <div class="field-hint">各地区独立计算上限，避免日本、韩国等节点较多的地区占满整个节点池。</div>
+          <div class="muted" id="node-cache-status" style="font-size:12px;margin-top:10px">当前占用 0；每地区最多 10</div>
         </div></div>
       </div>
     </section>

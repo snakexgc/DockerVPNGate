@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
-    DATA_DIR, DEFAULT_NODE_CACHE_SIZE, MAX_NODE_CACHE_SIZE, MIN_NODE_CACHE_SIZE,
+    DATA_DIR, DEFAULT_REGION_NODE_LIMIT, MAX_REGION_NODE_LIMIT, MIN_REGION_NODE_LIMIT,
     NODES_FILE, PROXY_INTERFACES, PROXY_PORTS, UI_HOST, UI_PORT,
 )
 
@@ -92,7 +92,7 @@ def load_ui_config() -> dict[str, Any]:
             "host": UI_HOST, "port": UI_PORT,
             "proxy_username": os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME") or "",
             "proxy_password": os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD") or "",
-            "node_cache_size": DEFAULT_NODE_CACHE_SIZE,
+            "region_node_limit": DEFAULT_REGION_NODE_LIMIT,
             "proxy_slots": normalize_proxy_slots(None),
         }
         updated = False
@@ -122,14 +122,17 @@ def load_ui_config() -> dict[str, Any]:
             if key not in data:
                 updated = True
             config[key] = str(config.get(key) or "")
+        legacy_cache_size = config.pop("node_cache_size", None)
+        if legacy_cache_size is not None:
+            updated = True
         try:
-            cache_size = int(config.get("node_cache_size", DEFAULT_NODE_CACHE_SIZE))
+            region_node_limit = int(config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT))
         except (TypeError, ValueError):
-            cache_size = DEFAULT_NODE_CACHE_SIZE
-        if not MIN_NODE_CACHE_SIZE <= cache_size <= MAX_NODE_CACHE_SIZE:
-            cache_size = DEFAULT_NODE_CACHE_SIZE
-        if config.get("node_cache_size") != cache_size:
-            config["node_cache_size"] = cache_size; updated = True
+            region_node_limit = DEFAULT_REGION_NODE_LIMIT
+        if not MIN_REGION_NODE_LIMIT <= region_node_limit <= MAX_REGION_NODE_LIMIT:
+            region_node_limit = DEFAULT_REGION_NODE_LIMIT
+        if config.get("region_node_limit") != region_node_limit:
+            config["region_node_limit"] = region_node_limit; updated = True
         for key in ("proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"):
             if key in config:
                 config.pop(key, None); updated = True

@@ -115,6 +115,178 @@ class DashboardPayloadTests(unittest.TestCase):
         self.assertIn("Canada", choices[0]["aliases"])
 
 
+class RegionNodePoolTests(unittest.TestCase):
+    @staticmethod
+    def node(
+        node_id: str,
+        country: str,
+        status: str,
+        latency: int = 0,
+        origin: str = "existing",
+        ip_type: str = "hosting",
+    ) -> dict[str, object]:
+        return {
+            "id": node_id,
+            "country": country,
+            "probe_status": status,
+            "latency_ms": latency,
+            "latency_source": vpngate_manager.LATENCY_SOURCE,
+            "score": 100,
+            "_pool_origin": origin,
+            "ip_type": ip_type,
+        }
+
+    def test_limit_is_applied_independently_per_region(self) -> None:
+        nodes = [
+            self.node("jp1", "Japan", NODE_STATUS_AVAILABLE, 20),
+            self.node("jp2", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("jp3", "Japan", NODE_STATUS_AVAILABLE, 40),
+            self.node("kr1", "Korea Republic of", NODE_STATUS_AVAILABLE, 25),
+            self.node("kr2", "Korea Republic of", NODE_STATUS_AVAILABLE, 35),
+        ]
+        selected, stats = vpngate_manager.merge_node_cache([], nodes, 2)
+        counts: dict[str, int] = {}
+        for node in selected:
+            country = vpngate_manager.normalized_country_name(node["country"])
+            counts[country] = counts.get(country, 0) + 1
+        self.assertEqual(sorted(counts.values()), [2, 2])
+        self.assertEqual(stats["region_limit"], 2)
+
+    def test_valid_new_nodes_replace_timeout_then_slow_old_nodes(self) -> None:
+        nodes = [
+            self.node("old-timeout", "Japan", NODE_STATUS_UNAVAILABLE),
+            self.node("old-fast", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("old-slow", "Japan", NODE_STATUS_AVAILABLE, 300),
+            self.node("new-fast", "Japan", NODE_STATUS_AVAILABLE, 40, "new"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 2)
+        self.assertEqual({node["id"] for node in selected}, {"old-fast", "new-fast"})
+
+    def test_valid_new_node_replaces_slowest_old_even_when_new_is_slower(self) -> None:
+        nodes = [
+            self.node("old-fast", "Japan", NODE_STATUS_AVAILABLE, 20),
+            self.node("old-slow", "Japan", NODE_STATUS_AVAILABLE, 200),
+            self.node("new-valid", "Japan", NODE_STATUS_AVAILABLE, 500, "new"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 2)
+        self.assertEqual({node["id"] for node in selected}, {"old-fast", "new-valid"})
+
+    def test_region_limit_reserves_half_for_residential_or_mobile_nodes(self) -> None:
+        nodes = [
+            self.node("hosting-fast", "Japan", NODE_STATUS_AVAILABLE, 10),
+            self.node("hosting-medium", "Japan", NODE_STATUS_AVAILABLE, 20),
+            self.node("hosting-slow", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("residential", "Japan", NODE_STATUS_AVAILABLE, 400, ip_type="residential"),
+            self.node("mobile", "Japan", NODE_STATUS_AVAILABLE, 500, ip_type="mobile"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 4)
+        self.assertEqual(
+            {node["id"] for node in selected},
+            {"hosting-fast", "hosting-medium", "residential", "mobile"},
+        )
+
+    def test_odd_region_limit_rounds_residential_reservation_up(self) -> None:
+        nodes = [
+            self.node("hosting-1", "Japan", NODE_STATUS_AVAILABLE, 10),
+            self.node("hosting-2", "Japan", NODE_STATUS_AVAILABLE, 20),
+            self.node("hosting-3", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("residential-1", "Japan", NODE_STATUS_AVAILABLE, 300, ip_type="residential"),
+            self.node("residential-2", "Japan", NODE_STATUS_AVAILABLE, 400, ip_type="residential"),
+            self.node("mobile", "Japan", NODE_STATUS_AVAILABLE, 500, ip_type="mobile"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 5)
+        selected_residential = [
+            node for node in selected if node["ip_type"] in ("residential", "mobile")
+        ]
+        self.assertEqual(len(selected_residential), 3)
+
+    def test_residential_shortage_keeps_available_hosting_nodes(self) -> None:
+        nodes = [
+            self.node("residential", "Japan", NODE_STATUS_AVAILABLE, 300, ip_type="residential"),
+            self.node("hosting-1", "Japan", NODE_STATUS_AVAILABLE, 10),
+            self.node("hosting-2", "Japan", NODE_STATUS_AVAILABLE, 20),
+            self.node("hosting-3", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("residential-down", "Japan", NODE_STATUS_UNAVAILABLE, ip_type="residential"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 4)
+        self.assertEqual(
+            {node["id"] for node in selected},
+            {"residential", "hosting-1", "hosting-2", "hosting-3"},
+        )
+
+    def test_residential_above_half_competes_by_latency(self) -> None:
+        nodes = [
+            self.node("residential-fast", "Japan", NODE_STATUS_AVAILABLE, 10, ip_type="residential"),
+            self.node("mobile-fast", "Japan", NODE_STATUS_AVAILABLE, 20, ip_type="mobile"),
+            self.node("residential-slow", "Japan", NODE_STATUS_AVAILABLE, 500, ip_type="residential"),
+            self.node("hosting-1", "Japan", NODE_STATUS_AVAILABLE, 30),
+            self.node("hosting-2", "Japan", NODE_STATUS_AVAILABLE, 40),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 4)
+        self.assertEqual(
+            {node["id"] for node in selected},
+            {"residential-fast", "mobile-fast", "hosting-1", "hosting-2"},
+        )
+
+    def test_all_timeout_region_rotates_to_new_nodes_without_shrinking(self) -> None:
+        nodes = [
+            self.node("old1", "Canada", NODE_STATUS_UNAVAILABLE),
+            self.node("old2", "Canada", NODE_STATUS_UNAVAILABLE),
+            self.node("new1", "Canada", NODE_STATUS_UNAVAILABLE, origin="new"),
+            self.node("new2", "Canada", NODE_STATUS_UNAVAILABLE, origin="new"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 2)
+        self.assertEqual({node["id"] for node in selected}, {"new1", "new2"})
+
+    def test_active_node_is_protected_from_region_trim(self) -> None:
+        nodes = [
+            self.node("active", "Japan", NODE_STATUS_UNAVAILABLE),
+            self.node("new", "Japan", NODE_STATUS_AVAILABLE, 10, "new"),
+        ]
+        selected, _stats = vpngate_manager.merge_node_cache([], nodes, 1, {"active"})
+        self.assertEqual([node["id"] for node in selected], ["active"])
+
+    def test_fetch_failure_keeps_local_pool_and_completes_startup_test(self) -> None:
+        existing = [self.node("old", "Canada", NODE_STATUS_AVAILABLE, 30)]
+        old_done = vpngate_manager.initial_node_pool_test_done
+        try:
+            vpngate_manager.initial_node_pool_test_done = False
+            with (
+                patch.object(vpngate_manager, "read_nodes", return_value=existing),
+                patch.object(vpngate_manager, "fetch_candidates", side_effect=RuntimeError("offline")),
+                patch.object(vpngate_manager, "load_ui_config", return_value={"region_node_limit": 2, "proxy_slots": [{} for _ in PROXY_PORTS]}),
+                patch.object(vpngate_manager, "test_multiple_nodes") as test_nodes,
+                patch.object(vpngate_manager, "ensure_proxy_slot"),
+                patch.object(vpngate_manager, "pending_probe_count_from_nodes", return_value=0),
+                patch.object(vpngate_manager, "set_state"),
+                patch.object(vpngate_manager, "log_to_json"),
+            ):
+                message = vpngate_manager.multi_maintain_nodes(force=True, wait=True)
+            test_nodes.assert_called_once_with(["old"])
+            self.assertIn("本地池已保留", message)
+            self.assertTrue(vpngate_manager.initial_node_pool_test_done)
+        finally:
+            vpngate_manager.initial_node_pool_test_done = old_done
+
+    def test_staged_refresh_failure_restores_previous_snapshot(self) -> None:
+        existing = [self.node("old", "Canada", NODE_STATUS_AVAILABLE, 30)]
+        fetched = [self.node("new", "Canada", NODE_STATUS_QUEUED, origin="new")]
+        writes: list[tuple[Path, object]] = []
+        with (
+            patch.object(vpngate_manager, "read_nodes", return_value=existing),
+            patch.object(vpngate_manager, "fetch_candidates", return_value=fetched),
+            patch.object(vpngate_manager, "load_ui_config", return_value={"region_node_limit": 2, "proxy_slots": [{} for _ in PROXY_PORTS]}),
+            patch.object(vpngate_manager, "test_multiple_nodes", side_effect=RuntimeError("probe crashed")),
+            patch.object(vpngate_manager, "set_state"),
+            patch.object(vpngate_manager, "write_json", side_effect=lambda path, data: writes.append((path, data))),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "probe crashed"):
+                vpngate_manager.multi_maintain_nodes(force=True, wait=True)
+        node_writes = [data for path, data in writes if path == vpngate_manager.NODES_FILE]
+        self.assertGreaterEqual(len(node_writes), 2)
+        self.assertEqual(node_writes[-1], existing)
+
+
 class NetworkIsolationTests(unittest.TestCase):
     def test_managed_openvpn_cannot_modify_container_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -295,6 +467,163 @@ class SchedulerTests(unittest.TestCase):
             mocked_connect.assert_called_once_with(0, "fast-node")
         finally:
             vpngate_manager.initial_node_pool_test_done = old_done
+            vpngate_manager.proxy_slots_runtime[0].clear()
+            vpngate_manager.proxy_slots_runtime[0].update(old_runtime)
+
+    def test_automatic_country_selection_prefers_an_unused_region(self) -> None:
+        nodes = [
+            {
+                "id": "used-japan",
+                "country": "Japan",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 10,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+            {
+                "id": "free-japan",
+                "country": "Japan",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 20,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+            {
+                "id": "free-canada",
+                "country": "Canada",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 40,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+        ]
+        with (
+            patch.object(vpngate_manager, "load_ui_config", return_value=self._proxy_config()),
+            patch.object(vpngate_manager, "read_nodes", return_value=nodes),
+            patch.object(vpngate_manager, "used_node_ids", return_value={"used-japan"}),
+        ):
+            candidates = vpngate_manager.slot_candidates(0)
+
+        self.assertEqual([node["id"] for node in candidates], ["free-canada", "free-japan"])
+
+    def test_automatic_country_selection_falls_back_to_real_latency(self) -> None:
+        nodes = [
+            {
+                "id": "unverified-fastest",
+                "country": "Japan",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 5,
+                "latency_source": "legacy-entry-ping",
+                "score": 100,
+            },
+            {
+                "id": "japan-slow",
+                "country": "Japan",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 80,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+            {
+                "id": "japan-fast",
+                "country": "Japan",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 25,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+        ]
+        with (
+            patch.object(vpngate_manager, "load_ui_config", return_value=self._proxy_config()),
+            patch.object(vpngate_manager, "read_nodes", return_value=nodes),
+            patch.object(vpngate_manager, "used_node_ids", return_value=set()),
+        ):
+            candidates = vpngate_manager.slot_candidates(0)
+
+        self.assertEqual([node["id"] for node in candidates], ["japan-fast", "japan-slow"])
+
+    def test_auto_switch_uses_lowest_latency_node_in_failed_region(self) -> None:
+        old_done = vpngate_manager.initial_node_pool_test_done
+        old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
+        try:
+            vpngate_manager.initial_node_pool_test_done = True
+            vpngate_manager.proxy_slots_runtime[0].update(
+                process=None,
+                active_node_id="",
+                connecting=False,
+                switch_country="Japan",
+                error="",
+            )
+            nodes = [
+                {
+                    "id": "canada-faster",
+                    "country": "Canada",
+                    "probe_status": NODE_STATUS_AVAILABLE,
+                    "latency_ms": 10,
+                    "latency_source": vpngate_manager.LATENCY_SOURCE,
+                    "score": 100,
+                },
+                {
+                    "id": "japan-slow",
+                    "country": "Japan",
+                    "probe_status": NODE_STATUS_AVAILABLE,
+                    "latency_ms": 90,
+                    "latency_source": vpngate_manager.LATENCY_SOURCE,
+                    "score": 100,
+                },
+                {
+                    "id": "japan-fast",
+                    "country": "Japan",
+                    "probe_status": NODE_STATUS_AVAILABLE,
+                    "latency_ms": 30,
+                    "latency_source": vpngate_manager.LATENCY_SOURCE,
+                    "score": 100,
+                },
+            ]
+            with (
+                patch.object(vpngate_manager, "load_ui_config", return_value=self._proxy_config()),
+                patch.object(vpngate_manager, "read_nodes", return_value=nodes),
+                patch.object(vpngate_manager, "slot_process_running", return_value=False),
+                patch.object(vpngate_manager, "connect_proxy_slot") as mocked_connect,
+            ):
+                vpngate_manager.ensure_proxy_slot(0)
+
+            mocked_connect.assert_called_once_with(0, "japan-fast")
+        finally:
+            vpngate_manager.initial_node_pool_test_done = old_done
+            vpngate_manager.proxy_slots_runtime[0].clear()
+            vpngate_manager.proxy_slots_runtime[0].update(old_runtime)
+
+    def test_timeout_switch_remembers_failed_node_region_after_stop(self) -> None:
+        old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
+        try:
+            runtime = vpngate_manager.proxy_slots_runtime[0]
+            runtime.update(
+                active_node_id="failed-japan",
+                google204_timeout_failures=vpngate_manager.ACTIVE_PROXY_GOOGLE204_TIMEOUT_LIMIT - 1,
+                last_google204_check=0,
+                switch_country="",
+            )
+            nodes = [{"id": "failed-japan", "country": "Japan"}]
+
+            def fake_stop(_index: int, _reason: str) -> None:
+                runtime.update(active_node_id="", switch_country="")
+
+            with (
+                patch.object(vpngate_manager, "slot_process_running", return_value=True),
+                patch.object(
+                    vpngate_manager,
+                    "measure_active_proxy_google204",
+                    return_value=(False, 0, "timeout", 1),
+                ),
+                patch.object(vpngate_manager, "load_ui_config", return_value=self._proxy_config()),
+                patch.object(vpngate_manager, "mark_active_node_unavailable"),
+                patch.object(vpngate_manager, "stop_proxy_slot", side_effect=fake_stop),
+            ):
+                vpngate_manager.run_active_proxy_google204_check(0, nodes, now=100)
+
+            self.assertEqual(runtime["switch_country"], "Japan")
+        finally:
             vpngate_manager.proxy_slots_runtime[0].clear()
             vpngate_manager.proxy_slots_runtime[0].update(old_runtime)
 

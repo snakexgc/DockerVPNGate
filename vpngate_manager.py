@@ -79,15 +79,15 @@ from vpngate_app.web_api import create_handler
 
 from vpngate_app.config import (
     API_URL, AUTH_FILE, BLACKLIST_FILE, CHECK_INTERVAL_SECONDS, CONFIG_DIR, DATA_DIR,
-    DEFAULT_NODE_CACHE_SIZE, INITIAL_CONNECT_TEST_LIMIT,
+    DEFAULT_REGION_NODE_LIMIT, INITIAL_CONNECT_TEST_LIMIT,
     INVALID_BACKOFF_SECONDS, LOCAL_PROXY_HOST, MANUAL_TEST_NODE_LIMIT,
-    MAX_NODE_CACHE_SIZE, MAX_SCAN_ROWS, MIN_NODE_CACHE_SIZE, NODES_FILE,
+    MAX_REGION_NODE_LIMIT, MAX_SCAN_ROWS, MIN_REGION_NODE_LIMIT, NODES_FILE,
     OPENVPN_AUTH_PASS, OPENVPN_AUTH_USER, OPENVPN_CMD, OPENVPN_TEST_TIMEOUT_SECONDS,
     PROXY_INTERFACES, PROXY_PORTS, ROOT_DIR, STATE_FILE, UI_HOST, UI_PORT,
     UPSTREAM_PROXY_AUTH_FILE, WEB_DIR, env_int,
 )
 from vpngate_app.logging_io import Tee
-from vpngate_app.logging_utils import log_to_json
+from vpngate_app.logging_utils import log_to_json, read_log_entries
 from vpngate_app.storage import load_ui_config, read_json, read_nodes, save_ui_config, write_json
 from vpngate_app.traffic import TrafficMonitor
 from vpngate_app.node_testing import (
@@ -134,6 +134,7 @@ proxy_slots_runtime: list[dict[str, Any]] = [
         "proxy_latency_ms": 0,
         "error": "",
         "using_fallback": False,
+        "switch_country": "",
         "last_health_check": 0.0,
         "last_google204_check": 0.0,
         "google204_timeout_failures": 0,
@@ -252,6 +253,7 @@ def _stop_proxy_slot_locked(index: int, reason: str = "") -> None:
         proxy_latency_ms=0,
         error=reason,
         using_fallback=False,
+        switch_country="",
         health_failures=0,
         last_google204_check=0.0,
         google204_timeout_failures=0,
@@ -296,25 +298,32 @@ def configured_fixed_node_ids(config: dict[str, Any] | None = None) -> set[str]:
     }
 
 
-def slot_candidates(index: int, preferred_only: bool = False) -> list[dict[str, Any]]:
+def slot_candidates(index: int, country_filter: str = "") -> list[dict[str, Any]]:
     config = load_ui_config()["proxy_slots"][index]
-    preferred_country = str(config.get("preferred_country") or "").strip()
     ip_type = str(config.get("routing_ip_type") or "all")
     used = used_node_ids(index)
+    nodes = read_nodes()
+    used_countries = {
+        normalized_country_name(node.get("country"))
+        for node in nodes
+        if str(node.get("id") or "") in used and node.get("country")
+    }
     candidates = []
-    for node in read_nodes():
-        if node.get("id") in used or node.get("probe_status") != NODE_STATUS_AVAILABLE:
+    for node in nodes:
+        if str(node.get("id") or "") in used or node.get("probe_status") != NODE_STATUS_AVAILABLE:
+            continue
+        if node.get("latency_source") != LATENCY_SOURCE or parse_int(node.get("latency_ms")) <= 0:
             continue
         if ip_type == "residential" and node.get("ip_type") not in ("residential", "mobile"):
             continue
         if ip_type == "hosting" and node.get("ip_type") != "hosting":
             continue
-        if preferred_only and preferred_country and not country_matches(node.get("country"), preferred_country):
+        if country_filter and not country_matches(node.get("country"), country_filter):
             continue
         candidates.append(node)
     candidates.sort(
         key=lambda node: (
-            0 if preferred_country and country_matches(node.get("country"), preferred_country) else 1,
+            0 if country_filter or normalized_country_name(node.get("country")) not in used_countries else 1,
             parse_int(node.get("latency_ms")) or 999999,
             -parse_int(node.get("score")),
         )
@@ -436,6 +445,7 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
             latency_ms=latency,
             google204_timeout_failures=0,
             last_google204_check=time.time(),
+            switch_country="",
         )
         runtime["connecting"] = False
         log_to_json("INFO", f"Proxy{index + 1}", f"已连接 {node_id}，接口 {PROXY_INTERFACES[index]}，端口 {PROXY_PORTS[index]}")
@@ -577,9 +587,12 @@ def ensure_proxy_slot(index: int) -> None:
         proxy_slots_runtime[index]["using_fallback"] = False
         return
 
-    candidates = slot_candidates(index, preferred_only=bool(preferred_country))
-    if not candidates:
-        candidates = slot_candidates(index, preferred_only=False)
+    switch_country = str(proxy_slots_runtime[index].get("switch_country") or "").strip()
+    current_country = str(current.get("country") or "").strip() if current else ""
+    target_country = preferred_country or switch_country or current_country
+    candidates = slot_candidates(index, target_country)
+    if not candidates and target_country:
+        candidates = slot_candidates(index)
     if slot_process_running(index) and current and candidates and candidates[0].get("id") == current.get("id"):
         proxy_slots_runtime[index]["using_fallback"] = bool(
             preferred_country and not country_matches(current.get("country"), preferred_country)
@@ -677,7 +690,10 @@ def multi_dashboard_state() -> dict[str, Any]:
         "slots": [proxy_slot_payload(index, nodes, config) for index in range(len(PROXY_PORTS))],
         "countries": country_choice_payloads(nodes),
         "node_count": len(nodes),
-        "node_cache_size": int(config.get("node_cache_size", DEFAULT_NODE_CACHE_SIZE)),
+        "region_node_limit": int(config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT)),
+        "node_cache_size": len(country_choice_payloads(nodes)) * int(
+            config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT)
+        ),
         "node_cache_count": len(nodes),
         "fetch_interval_seconds": node_pool_retest_interval_seconds(len(nodes)),
         "last_fetch_at": state.get("last_fetch_at", 0),
@@ -734,6 +750,41 @@ def _node_timestamp(node: dict[str, Any], *keys: str, default: float) -> float:
     return default
 
 
+def stage_fetched_node_candidates(
+    existing_nodes: list[dict[str, Any]],
+    fetched_nodes: list[dict[str, Any]],
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Build an untrimmed old/new union so every candidate can be tested first."""
+    now = now or time.time()
+    staged: dict[str, dict[str, Any]] = {}
+    for source in existing_nodes:
+        node_id = str(source.get("id") or "")
+        if not node_id:
+            continue
+        node = dict(source)
+        node["_pool_origin"] = "existing"
+        staged[node_id] = node
+    for source in fetched_nodes:
+        node_id = str(source.get("id") or "")
+        if not node_id:
+            continue
+        previous = staged.get(node_id)
+        node = dict(source)
+        if previous:
+            for key in NODE_RUNTIME_FIELDS:
+                if key in previous:
+                    node[key] = previous[key]
+            node["first_fetched_at"] = _node_timestamp(
+                previous, "first_fetched_at", "fetched_at", default=now
+            )
+            node["_pool_origin"] = "existing"
+        else:
+            node["_pool_origin"] = "new"
+        staged[node_id] = node
+    return sort_all_nodes(list(staged.values()))
+
+
 def merge_node_cache(
     existing_nodes: list[dict[str, Any]],
     fetched_nodes: list[dict[str, Any]],
@@ -741,21 +792,18 @@ def merge_node_cache(
     active_node_ids: set[str] | None = None,
     now: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Merge one API snapshot into the persistent node cache.
-
-    Unavailable nodes are evicted first. If more space is still needed, tested
-    nodes with the highest measured latency are evicted next. Active proxy
-    nodes are always protected from eviction.
-    """
+    """Select a per-region pool from an already tested API/cache union."""
     now = now or time.time()
-    capacity = max(MIN_NODE_CACHE_SIZE, min(MAX_NODE_CACHE_SIZE, int(capacity)))
+    region_limit = max(MIN_REGION_NODE_LIMIT, min(MAX_REGION_NODE_LIMIT, int(capacity)))
     active_node_ids = {str(node_id) for node_id in (active_node_ids or set()) if node_id}
     merged_by_id: dict[str, dict[str, Any]] = {}
+    existing_ids: set[str] = set()
 
     for source in existing_nodes:
         node_id = str(source.get("id") or "")
         if not node_id:
             continue
+        existing_ids.add(node_id)
         node = dict(source)
         last_fetched_at = _node_timestamp(node, "last_fetched_at", "fetched_at", default=now)
         first_fetched_at = _node_timestamp(node, "first_fetched_at", "fetched_at", default=last_fetched_at)
@@ -792,41 +840,105 @@ def merge_node_cache(
         merged_by_id[node_id] = node
 
     merged = list(merged_by_id.values())
-    overflow = max(0, len(merged) - capacity)
-
-    def eviction_key(node: dict[str, Any]) -> tuple[int, int, float]:
-        status = str(node.get("probe_status") or NODE_STATUS_QUEUED)
-        latency = parse_int(node.get("latency_ms"))
-        last_seen = _node_timestamp(node, "last_fetched_at", "fetched_at", default=now)
-        if status == NODE_STATUS_UNAVAILABLE:
-            return (0, 0, last_seen)
-        if status == NODE_STATUS_AVAILABLE and latency > 0:
-            return (1, -latency, last_seen)
-        if status in (NODE_STATUS_QUEUED, NODE_STATUS_NOT_CHECKED, NODE_STATUS_TESTING):
-            return (2, 0, last_seen)
-        return (3, 0, last_seen)
-
-    removable = sorted(
-        (
-            node for node in merged
-            if str(node.get("id") or "") not in active_node_ids and not node.get("active")
-        ),
-        key=eviction_key,
+    fetched_ids = {str(node.get("id") or "") for node in fetched_nodes if node.get("id")}
+    existing_ids.update(
+        str(node.get("id") or "") for node in merged if node.get("_pool_origin") == "existing"
     )
-    evicted = removable[:overflow]
-    evicted_ids = {str(node.get("id") or "") for node in evicted}
-    kept = [node for node in merged if str(node.get("id") or "") not in evicted_ids]
+    tagged_new_ids = {
+        str(node.get("id") or "") for node in merged if node.get("_pool_origin") == "new"
+    }
+    new_ids = tagged_new_ids or (fetched_ids - existing_ids)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for node in merged:
+        region = normalized_country_name(node.get("country")) or str(node.get("country_short") or "未知地区")
+        groups.setdefault(region, []).append(node)
+
+    kept: list[dict[str, Any]] = []
+    for region_nodes in groups.values():
+        protected = [
+            node for node in region_nodes
+            if str(node.get("id") or "") in active_node_ids or node.get("active")
+        ]
+        protected_ids = {str(node.get("id") or "") for node in protected}
+        selectable = [node for node in region_nodes if str(node.get("id") or "") not in protected_ids]
+        available = [node for node in selectable if node.get("probe_status") == NODE_STATUS_AVAILABLE]
+        available_sort_key = lambda node: (
+            # A tested new node consumes replacement quota first; among the
+            # remaining old nodes, the slowest one is therefore displaced.
+            0 if str(node.get("id") or "") in new_ids else 1,
+            parse_int(node.get("latency_ms")) or 999999,
+            -parse_int(node.get("score")),
+        )
+        available.sort(key=available_sort_key)
+        slots_left = max(0, region_limit - len(protected))
+        residential_target = (region_limit + 1) // 2
+        protected_residential = sum(
+            1 for node in protected if node.get("ip_type") in ("residential", "mobile")
+        )
+        residential_slots = min(
+            slots_left,
+            max(0, residential_target - protected_residential),
+        )
+        residential_available = [
+            node for node in available if node.get("ip_type") in ("residential", "mobile")
+        ]
+        selected = residential_available[:residential_slots]
+        selected_ids = {str(node.get("id") or "") for node in selected}
+        remaining_available = [
+            node for node in available if str(node.get("id") or "") not in selected_ids
+        ]
+        selected.extend(remaining_available[:max(0, slots_left - len(selected))])
+        slots_left -= len(selected)
+        if slots_left:
+            has_available = any(node.get("probe_status") == NODE_STATUS_AVAILABLE for node in region_nodes)
+            fallback = [node for node in selectable if node not in selected]
+            fallback.sort(key=lambda node: (
+                # When an entire region failed, rotate in the newly fetched snapshot.
+                (0 if str(node.get("id") or "") in new_ids else 1)
+                if not has_available else
+                (0 if str(node.get("id") or "") in existing_ids else 1),
+                0 if node.get("probe_status") in PENDING_NODE_PROBE_STATUSES else 1,
+                -_node_timestamp(node, "last_fetched_at", "fetched_at", default=now),
+                -parse_int(node.get("score")),
+            ))
+            current_residential = protected_residential + sum(
+                1 for node in selected if node.get("ip_type") in ("residential", "mobile")
+            )
+            fallback_residential_slots = min(
+                slots_left,
+                max(0, residential_target - current_residential),
+            )
+            residential_fallback = [
+                node for node in fallback if node.get("ip_type") in ("residential", "mobile")
+            ]
+            chosen_residential_fallback = residential_fallback[:fallback_residential_slots]
+            selected.extend(chosen_residential_fallback)
+            selected_ids.update(str(node.get("id") or "") for node in selected)
+            fallback = [
+                node for node in fallback if str(node.get("id") or "") not in selected_ids
+            ]
+            slots_left -= len(chosen_residential_fallback)
+            selected.extend(fallback[:slots_left])
+        kept.extend(protected + selected)
+
+    kept_ids = {str(node.get("id") or "") for node in kept}
+    evicted = [node for node in merged if str(node.get("id") or "") not in kept_ids]
+    for node in kept:
+        node.pop("_pool_origin", None)
     stats = {
-        "capacity": capacity,
+        "capacity": region_limit * len(groups),
+        "region_limit": region_limit,
+        "region_count": len(groups),
         "fetched_count": len(fetched_nodes),
-        "new_count": new_count,
-        "updated_count": updated_count,
+        "new_count": len(new_ids),
+        "updated_count": len(fetched_ids & existing_ids),
         "evicted_count": len(evicted),
         "evicted_unavailable": sum(1 for node in evicted if node.get("probe_status") == NODE_STATUS_UNAVAILABLE),
         "evicted_slow": sum(
             1 for node in evicted
             if node.get("probe_status") == NODE_STATUS_AVAILABLE and parse_int(node.get("latency_ms")) > 0
         ),
+        "replaced_old": sum(1 for node in evicted if str(node.get("id") or "") in existing_ids),
         "pool_size": len(kept),
     }
     return sort_all_nodes(kept), stats
@@ -837,6 +949,7 @@ def merge_fetched_nodes(fetched: list[dict[str, Any]], capacity: int) -> list[di
     merged, stats = merge_node_cache(read_nodes(), fetched, capacity, protected_ids)
     write_json(NODES_FILE, merged)
     set_state(
+        region_node_limit=stats["region_limit"],
         node_cache_size=stats["capacity"],
         node_cache_count=stats["pool_size"],
         last_fetch_candidate_count=stats["fetched_count"],
@@ -852,7 +965,11 @@ def resize_node_cache(capacity: int) -> dict[str, int]:
     protected_ids = used_node_ids() | configured_fixed_node_ids()
     resized, stats = merge_node_cache(read_nodes(), [], capacity, protected_ids)
     write_json(NODES_FILE, resized)
-    set_state(node_cache_size=stats["capacity"], node_cache_count=stats["pool_size"])
+    set_state(
+        region_node_limit=stats["region_limit"],
+        node_cache_size=stats["capacity"],
+        node_cache_count=stats["pool_size"],
+    )
     return stats
 
 
@@ -1036,13 +1153,35 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         return "节点维护任务正在运行"
     try:
         last_collector_heartbeat = time.time()
-        set_state(last_check_message="正在获取 VPNGate 节点列表，合并后将使用 8 线程检测...")
-        fetched = fetch_candidates()
+        existing_snapshot = read_nodes()
+        set_state(last_check_message="正在获取 VPNGate 节点列表；新旧节点全部测试后再按地区更新节点池...")
+        fetched: list[dict[str, Any]] = []
+        fetch_error: Exception | None = None
+        try:
+            fetched = fetch_candidates()
+        except Exception as exc:
+            fetch_error = exc
+            if not existing_snapshot:
+                raise
+            log_to_json("WARNING", "NodePool", f"节点拉取失败，保留本地节点池并继续启动检测: {exc}")
+            set_state(last_check_message=f"节点拉取失败，保留 {len(existing_snapshot)} 个本地节点并进行连接测试...")
         config = load_ui_config()
-        cache_size = int(config.get("node_cache_size", DEFAULT_NODE_CACHE_SIZE))
-        nodes = merge_fetched_nodes(fetched, cache_size) if fetched else read_nodes()
+        region_limit = int(config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT))
+        staged_refresh = bool(fetched)
+        if staged_refresh:
+            nodes = stage_fetched_node_candidates(existing_snapshot, fetched)
+            write_json(NODES_FILE, nodes)
+            set_state(
+                last_fetch_candidate_count=len(fetched),
+                last_check_message=(
+                    f"已暂存 {len(existing_snapshot)} 个本地节点和 {len(fetched)} 个拉取结果，"
+                    f"正在对 {len(nodes)} 个去重节点进行 Google 204 测试..."
+                ),
+            )
+        else:
+            nodes = existing_snapshot
         preferred = [str(slot.get("preferred_country") or "") for slot in config["proxy_slots"]]
-        full_pool_test = force or not initial_node_pool_test_done
+        full_pool_test = staged_refresh or force or not initial_node_pool_test_done
         node_ids = probe_candidate_node_ids(
             nodes,
             preferred,
@@ -1052,6 +1191,25 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         if node_ids:
             with vpn_operation_lock:
                 test_multiple_nodes(node_ids)
+        if staged_refresh:
+            protected_ids = used_node_ids() | configured_fixed_node_ids(config)
+            finalized, stats = merge_node_cache([], read_nodes(), region_limit, protected_ids)
+            write_json(NODES_FILE, finalized)
+            set_state(
+                region_node_limit=stats["region_limit"],
+                node_cache_size=stats["capacity"],
+                node_cache_count=stats["pool_size"],
+                last_cache_new_count=stats["new_count"],
+                last_cache_evicted_count=stats["evicted_count"],
+                last_cache_evicted_unavailable=stats["evicted_unavailable"],
+                last_cache_evicted_slow=stats["evicted_slow"],
+                last_cache_replaced_old=stats["replaced_old"],
+            )
+            log_to_json(
+                "INFO", "NodePool",
+                f"地区节点池更新完成：{stats['region_count']} 个地区，每地区最多 {region_limit} 个，"
+                f"保留 {stats['pool_size']} 个，替换旧节点 {stats['replaced_old']} 个",
+            )
         if full_pool_test:
             initial_node_pool_test_done = True
         for index in range(len(PROXY_PORTS)):
@@ -1064,13 +1222,20 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
                 f"本轮并发检测 {len(node_ids)} 个，剩余 {remaining} 个将在后续维护中继续检测"
             )
         else:
-            message = f"节点维护完成：{len(current_nodes)} 个节点均已由 8 个工作线程检测"
+            suffix = f"；API 拉取失败但本地池已保留 ({fetch_error})" if fetch_error else ""
+            message = f"节点维护完成：{len(current_nodes)} 个节点均已由 8 个工作线程检测{suffix}"
         set_state(last_check_message=message)
         return message
     except NodeTestCancelled:
+        if 'staged_refresh' in locals() and staged_refresh:
+            write_json(NODES_FILE, existing_snapshot)
         message = "节点测试已取消，正在切换到更新节点流程"
         set_state(last_check_message=message)
         return message
+    except Exception:
+        if 'staged_refresh' in locals() and staged_refresh:
+            write_json(NODES_FILE, existing_snapshot)
+        raise
     finally:
         maintenance_lock.release()
 
@@ -1198,8 +1363,11 @@ def run_active_proxy_google204_check(index: int, nodes: list[dict[str, Any]], no
                 f"Google 204 连续超时 {timeout_failures} 次，"
                 "已标记当前节点不可用并自动切换"
             )
+            failed_node = node_for_runtime(index, nodes)
+            switch_country = str(failed_node.get("country") or "").strip() if failed_node else ""
             mark_active_node_unavailable(index, switch_message)
             stop_proxy_slot(index, switch_message)
+            runtime["switch_country"] = switch_country
         else:
             runtime["error"] = (
                 f"Google 204 连续超时 {timeout_failures} 次，"
@@ -1249,12 +1417,11 @@ def multi_proxy_monitor() -> None:
 
 def main() -> None:
     ensure_dirs()
-    kill_existing_openvpn_processes()
-
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
     sys.stdout = tee
     sys.stderr = tee
+    kill_existing_openvpn_processes()
 
     migrated_latency_records = migrate_legacy_node_latencies()
     if migrated_latency_records:

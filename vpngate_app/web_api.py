@@ -127,13 +127,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, **APP.traffic_state_payload()})
         elif effective_path == "/api/settings":
             config = APP.load_ui_config()
+            region_limit = int(config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT))
             self.send_json({
                 "ok": True,
                 "username": config.get("username", ""),
                 "secret_path": config.get("secret_path", ""),
                 "proxy_username": config.get("proxy_username", ""),
                 "proxy_password": config.get("proxy_password", ""),
-                "node_cache_size": int(config.get("node_cache_size", APP.DEFAULT_NODE_CACHE_SIZE)),
+                "region_node_limit": region_limit,
+                "node_cache_size": region_limit * len(APP.country_choice_payloads(APP.read_nodes())),
                 "node_cache_count": len(APP.read_nodes()),
             })
         elif effective_path == "/api/nodes":
@@ -151,16 +153,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         elif effective_path == "/api/logs":
-            log_file = APP.DATA_DIR / "logs" / f"{time.strftime('%Y-%m-%d', time.localtime())}.json"
-            entries = []
-            if log_file.exists():
-                try:
-                    for line in log_file.read_text(encoding="utf-8").splitlines():
-                        if line.strip():
-                            entries.append(json.loads(line))
-                except Exception as exc:
-                    print(f"[API Logs] {exc}", flush=True)
-            self.send_json({"ok": True, "logs": entries[-1000:]})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            level = str((query.get("level") or [""])[0]).upper()
+            search = str((query.get("search") or [""])[0]).strip()
+            limit = max(1, min(2000, APP.parse_int((query.get("limit") or ["500"])[0]) or 500))
+            self.send_json({"ok": True, "logs": APP.read_log_entries(limit=limit, level=level, search=search)})
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -236,9 +233,12 @@ class Handler(BaseHTTPRequestHandler):
                 proxy_username = str(payload.get("proxy_username") or "").strip()
                 proxy_password = str(payload.get("proxy_password") or "")
                 try:
-                    node_cache_size = int(payload.get("node_cache_size", config.get("node_cache_size", APP.DEFAULT_NODE_CACHE_SIZE)))
+                    region_node_limit = int(payload.get(
+                        "region_node_limit",
+                        config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT),
+                    ))
                 except (TypeError, ValueError):
-                    raise ValueError("节点缓存池大小必须是整数")
+                    raise ValueError("每地区节点上限必须是整数")
                 if not username:
                     raise ValueError("管理用户名不能为空")
                 if password and password != password_confirm:
@@ -256,9 +256,9 @@ class Handler(BaseHTTPRequestHandler):
                     or not old_password
                 ):
                     raise ValueError("修改用户信息前，请输入正确的原密码")
-                if not APP.MIN_NODE_CACHE_SIZE <= node_cache_size <= APP.MAX_NODE_CACHE_SIZE:
+                if not APP.MIN_REGION_NODE_LIMIT <= region_node_limit <= APP.MAX_REGION_NODE_LIMIT:
                     raise ValueError(
-                        f"节点缓存池大小必须在 {APP.MIN_NODE_CACHE_SIZE} 到 {APP.MAX_NODE_CACHE_SIZE} 之间"
+                        f"每地区节点上限必须在 {APP.MIN_REGION_NODE_LIMIT} 到 {APP.MAX_REGION_NODE_LIMIT} 之间"
                     )
                 existing_proxy_username = str(config.get("proxy_username") or "")
                 existing_proxy_password = str(config.get("proxy_password") or "")
@@ -275,13 +275,13 @@ class Handler(BaseHTTPRequestHandler):
                 config["secret_path"] = secret_path
                 config["proxy_username"] = proxy_username
                 config["proxy_password"] = proxy_password
-                old_node_cache_size = int(config.get("node_cache_size", APP.DEFAULT_NODE_CACHE_SIZE))
-                config["node_cache_size"] = node_cache_size
+                old_region_node_limit = int(config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT))
+                config["region_node_limit"] = region_node_limit
                 APP.save_ui_config(config)
-                if node_cache_size != old_node_cache_size:
+                if region_node_limit != old_region_node_limit:
                     threading.Thread(
                         target=APP.resize_node_cache_when_idle,
-                        args=(node_cache_size,),
+                        args=(region_node_limit,),
                         daemon=True,
                     ).start()
                 APP.proxy_server.set_proxy_credentials(proxy_username, proxy_password)
@@ -293,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "reauth_required": reauth,
                     "secret_path": secret_path,
-                    "node_cache_size": node_cache_size,
+                    "region_node_limit": region_node_limit,
                 })
 
             elif effective_path == "/api/slots/update":
@@ -353,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "running": True, "message": "节点维护正在运行"})
                 else:
                     APP.schedule_node_refresh()
-                    self.send_json({"ok": True, "running": True, "message": "已开始拉取、合并并使用 8 线程检测节点"})
+                    self.send_json({"ok": True, "running": True, "message": "已开始拉取；新旧节点全量检测后再按地区更新节点池"})
 
             elif effective_path == "/api/nodes/test-cache":
                 if APP.node_test_is_active() or APP.node_test_start_pending.is_set():

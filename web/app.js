@@ -56,10 +56,69 @@ function refreshMarquees(root=document) {
     item.style.setProperty("--marquee-duration", `${Math.max(7, Math.min(18, overflow/18+7))}s`);
   }));
 }
+function resetTableColumns(table) {
+  table.querySelectorAll("colgroup col").forEach(col=>col.style.width="");
+  table.classList.remove("manual-column-widths");
+  table.style.width="";
+}
+function initializeResizableTables() {
+  document.querySelectorAll("table.resizable-table").forEach(table=>{
+    if(table.dataset.resizersReady)return;
+    table.dataset.resizersReady="true";
+    const headers=[...table.querySelectorAll("thead tr:first-child > th")];
+    let colgroup=table.querySelector("colgroup");
+    if(!colgroup) {
+      colgroup=document.createElement("colgroup");
+      headers.forEach(()=>colgroup.appendChild(document.createElement("col")));
+      table.insertBefore(colgroup,table.firstChild);
+    }
+    headers.slice(0,-1).forEach((header,index)=>{
+      const handle=document.createElement("span");
+      handle.className="column-resizer";
+      handle.title="拖动调整列宽，双击恢复自动宽度";
+      handle.setAttribute("aria-hidden","true");
+      handle.addEventListener("dblclick",event=>{
+        event.preventDefault();
+        event.stopPropagation();
+        resetTableColumns(table);
+      });
+      handle.addEventListener("pointerdown",event=>{
+        if(event.button!==0)return;
+        event.preventDefault();
+        event.stopPropagation();
+        const widths=headers.map(item=>item.getBoundingClientRect().width);
+        const columns=[...colgroup.children];
+        widths.forEach((width,columnIndex)=>columns[columnIndex].style.width=`${width}px`);
+        table.classList.add("manual-column-widths");
+        table.style.width=`${widths.reduce((sum,width)=>sum+width,0)}px`;
+        const startX=event.clientX, startWidth=widths[index], startTableWidth=widths.reduce((sum,width)=>sum+width,0);
+        const pointerId=event.pointerId;
+        handle.setPointerCapture(pointerId);
+        document.body.classList.add("resizing-columns");
+        const move=moveEvent=>{
+          const nextWidth=Math.max(64,startWidth+moveEvent.clientX-startX);
+          columns[index].style.width=`${nextWidth}px`;
+          table.style.width=`${startTableWidth+nextWidth-startWidth}px`;
+        };
+        const stop=()=>{
+          handle.removeEventListener("pointermove",move);
+          handle.removeEventListener("pointerup",stop);
+          handle.removeEventListener("pointercancel",stop);
+          if(handle.hasPointerCapture(pointerId))handle.releasePointerCapture(pointerId);
+          document.body.classList.remove("resizing-columns");
+        };
+        handle.addEventListener("pointermove",move);
+        handle.addEventListener("pointerup",stop);
+        handle.addEventListener("pointercancel",stop);
+      });
+      header.appendChild(handle);
+    });
+  });
+}
 function activeElementId() { return document.activeElement?.dataset?.selectId || document.activeElement?.id || ""; }
-function settingsInputIds() { return ["current-admin-password","admin-username","admin-password","admin-password-confirm","secret-path","proxy-username","proxy-password","node-cache-size"]; }
+function settingsInputIds() { return ["current-admin-password","admin-username","admin-password","admin-password-confirm","secret-path","proxy-username","proxy-password","region-node-limit"]; }
 function isSettingsFormActive() { return settingsInputIds().includes(activeElementId()); }
-function isNodeFilterActive() { return ["node-search","node-country","node-ip-type","node-status","all-node-search","all-node-country","all-node-type","all-node-status"].includes(activeElementId()); }
+function isNodeFilterActive() { return ["node-search","node-status","all-node-search","all-node-country","all-node-type","all-node-status"].includes(activeElementId()); }
 function shouldDeferHeartbeatRender() {
   if(currentScreen==="proxy")return proxyFormDirty || isProxyFormActive() || isNodeFilterActive();
   if(currentScreen==="settings")return settingsDirty || isSettingsFormActive();
@@ -193,29 +252,19 @@ function fillProxyForm(force=false) {
   const mode=document.querySelector(`[name="switch-mode"][value="${current.switch_mode||"auto"}"]`); if(mode)mode.checked=true;
   proxyFormDirty=false;
 }
-function fillProxyNodeFilters(reset=false,preferNodeCounts=false) {
-  const current=dashboard?.slots?.[currentSlot-1];
-  if(!current)return;
-  const countrySelect=$("node-country");
-  const previousCountry=countrySelect.value||"all";
-  const preferred=countryValue(current.preferred_country)||"";
-  const requestedCountry=reset ? (preferred||"all") : previousCountry;
-  setCountryOptions(countrySelect,"all","全部地区",dashboard.countries,requestedCountry,preferNodeCounts);
-  if(reset)$("node-ip-type").value=current.routing_ip_type||"all";
-  refreshSelect($("node-ip-type"));
-}
 function renderNodes() {
-  const search=$("node-search").value.trim().toLowerCase(), country=$("node-country").value, type=$("node-ip-type").value, status=$("node-status").value;
-  const preferred=countryValue(dashboard.slots[currentSlot-1].preferred_country);
+  const search=$("node-search").value.trim().toLowerCase(), country=countryValue($("preferred-country").value), type=$("routing-ip-type").value, status=$("node-status").value;
+  const preferred=country;
   const filtered=nodes.filter(node=>{
     const text=`${node.country_label||""} ${node.ip||""} ${node.remote_host||""} ${node.owner||""}`.toLowerCase();
-    const countryMatch=country==="all" || node.country===country || (node.country_label||node.country)===countryLabel(country);
+    const countryMatch=!country || node.country===country || (node.country_label||node.country)===countryLabel(country);
     const typeMatch=type==="all" || (type==="residential" ? ["residential","mobile"].includes(node.ip_type) : node.ip_type===type);
     return (!search||text.includes(search)) && countryMatch && typeMatch && (status==="all"||nodeStatusValue(node.probe_status)===status);
   }).sort((a,b)=>{
     const ap=preferred&&(a.country===preferred||(a.country_label||a.country)===countryLabel(preferred))?0:1,bp=preferred&&(b.country===preferred||(b.country_label||b.country)===countryLabel(preferred))?0:1;
     return ap-bp || (a.probe_status==="available"?0:1)-(b.probe_status==="available"?0:1) || (Number(a.latency_ms)||999999)-(Number(b.latency_ms)||999999);
   });
+  $("node-filter-summary").textContent=`跟随代理配置：${country?countryLabel(country):"全部地区（自动选择）"} · ${type==="all"?"全部 IP 类型":ipTypeText(type)}`;
   $("node-body").innerHTML=filtered.length?filtered.map(node=>`<tr><td><strong>${esc(node.country_label||node.country||"-")}</strong><div class="muted">${esc(node.location||node.country_short||"")}</div></td><td class="mono">${esc(node.ip||node.remote_host)}:${esc(node.remote_port||"")}</td><td>${esc(ipTypeText(node.ip_type))}</td><td>${node.latency_ms?node.latency_ms+" ms":"-"}</td><td>${esc(probeTime(node))}</td><td><span class="dot ${esc(nodeStatusValue(node.probe_status))}"></span>${esc(probeText(node.probe_status))}</td><td>${node.active_proxy?`代理 ${node.active_proxy}`:"-"}</td><td><button class="btn btn-sm ${node.active_proxy===currentSlot?"":"btn-primary"}" data-connect="${esc(node.id)}" ${node.active_proxy&&node.active_proxy!==currentSlot?"disabled":""}>${node.active_proxy===currentSlot?"当前节点":"连接"}</button> <button class="btn btn-sm" data-test="${esc(node.id)}">检测</button></td></tr>`).join(""):'<tr><td colspan="8" class="empty">没有符合条件的节点</td></tr>';
   document.querySelectorAll("[data-connect]").forEach(btn=>btn.onclick=()=>connectNode(btn.dataset.connect));
   document.querySelectorAll("[data-test]").forEach(btn=>btn.onclick=()=>testNode(btn.dataset.test));
@@ -226,7 +275,6 @@ async function loadNodes() {
   if(currentScreen==="proxy") {
     const preferred=$("preferred-country");
     setCountryOptions(preferred,"","自动选择",dashboard.countries,preferred.value,true);
-    fillProxyNodeFilters(false,true);
   }
   renderNodes();
 }
@@ -242,7 +290,8 @@ function renderAllNodes() {
   const available=nodes.filter(node=>node.probe_status==="available").length;
   const countries=new Set(nodes.map(node=>nodeCountryValue(node)).filter(Boolean)).size;
   const active=new Set(nodes.map(node=>node.active_proxy).filter(Boolean)).size;
-  $("all-node-total").textContent=`${nodes.length} / ${dashboard?.node_cache_size||150}`; $("all-node-available").textContent=available; $("all-node-countries").textContent=countries; $("all-node-active").textContent=`${active} / 5`;
+  $("all-node-total").textContent=`${nodes.length} / ${dashboard?.node_cache_size||0}`; $("all-node-available").textContent=available; $("all-node-countries").textContent=countries; $("all-node-active").textContent=`${active} / 5`;
+  renderRegionOverview();
   $("all-node-result-count").textContent=`显示 ${filtered.length} / ${nodes.length} 个节点`;
   $("node-source-message").textContent=dashboard?.maintenance_running ? "正在更新或并发检测节点，请稍候…" : `${dashboard?.last_check_message||"缓存池等待下一个拉取周期"} · 最近拉取 ${fetchTime(dashboard?.last_fetch_at)}`;
   $("all-node-body").innerHTML=filtered.length?filtered.map(node=>`<tr>
@@ -257,6 +306,39 @@ function renderAllNodes() {
     <td><span class="dot ${esc(nodeStatusValue(node.probe_status))}"></span>${esc(probeText(node.probe_status))}${node.active_proxy?`<div class="badge connected" style="margin-top:5px">代理 ${node.active_proxy}</div>`:""}</td>
   </tr>`).join(""):'<tr><td colspan="12" class="empty">没有符合筛选条件的节点</td></tr>';
   refreshMarquees($("all-node-body"));
+}
+function renderRegionOverview() {
+  const regions=new Map();
+  nodes.forEach(node=>{
+    const value=nodeCountryValue(node);
+    if(!value)return;
+    const status=nodeStatusValue(node.probe_status);
+    const region=regions.get(value)||{
+      value,
+      label:node.country_label||countryLabel(value)||value,
+      code:node.country_short||countryChoice(value)?.code||"",
+      total:0,
+      available:0,
+      unavailable:0,
+      pending:0,
+    };
+    region.total+=1;
+    if(status==="available")region.available+=1;
+    else if(status==="unavailable")region.unavailable+=1;
+    else region.pending+=1;
+    regions.set(value,region);
+  });
+  const items=[...regions.values()].sort((a,b)=>b.total-a.total||a.label.localeCompare(b.label,"zh-CN"));
+  $("region-overview-summary").textContent=`${items.length} 个地区 · ${nodes.length} 个节点`;
+  $("region-overview-grid").innerHTML=items.length?items.map(region=>`<div class="region-card">
+    <div class="region-card-title"><span class="region-flag">${flagEmoji(region.code)}</span><strong>${esc(region.label)}</strong></div>
+    <div class="region-counts">
+      <span class="region-count total"><em>节点</em><strong>${region.total}</strong></span>
+      <span class="region-count available"><em>可用</em><strong>${region.available}</strong></span>
+      <span class="region-count unavailable"><em>不可用</em><strong>${region.unavailable}</strong></span>
+      ${region.pending?`<span class="region-count pending"><em>待检测/检测中</em><strong>${region.pending}</strong></span>`:""}
+    </div>
+  </div>`).join(""):'<div class="region-empty">节点池中暂无地区数据</div>';
 }
 async function loadAllNodes() {
   const data=await api("nodes?slot=1"); nodes=data.nodes;
@@ -296,12 +378,13 @@ async function resetTraffic() {
 }
 function showScreen(screen, slot=currentSlot) {
   currentScreen=screen; currentSlot=slot; document.querySelectorAll(".screen").forEach(el=>el.classList.remove("active")); $(`screen-${screen}`).classList.add("active");
-  const titles={system:["系统状态","代理出口的实时运行状态"],nodes:["节点配置","查看本次获取的全部 VPNGate 节点并手动刷新"],proxy:[`代理 ${slot} 节点配置`,"选择首选地区、线路类型或指定节点"],settings:["设置","管理登录信息与代理端口认证"]};
+  const titles={system:["系统状态","代理出口的实时运行状态"],nodes:["节点配置","查看本次获取的全部 VPNGate 节点并手动刷新"],proxy:[`代理 ${slot} 节点配置`,"选择首选地区、线路类型或指定节点"],logs:["运行日志","查看节点池、隧道与代理的实时事件"],settings:["设置","管理登录信息与代理端口认证"]};
   $("page-title").textContent=titles[screen][0]; $("page-subtitle").textContent=titles[screen][1]; $("sidebar").classList.remove("open"); $("save-settings").classList.toggle("visible", screen==="settings"); $("reset-traffic").classList.toggle("visible", screen==="system"); renderNavigation();
   if(screen==="system")loadTraffic();
-  if(screen==="nodes")loadAllNodes().catch(e=>showToast(e.message,true)); if(screen==="proxy") { proxyFormDirty=false; fillProxyForm(true); fillProxyNodeFilters(true); loadNodes().catch(e=>showToast(e.message,true)); } if(screen==="settings"){fillSettings(); loadSettingsSecrets().catch(e=>showToast(e.message,true));}
+  if(screen==="logs")loadLogs().catch(e=>showToast(e.message,true));
+  if(screen==="nodes")loadAllNodes().catch(e=>showToast(e.message,true)); if(screen==="proxy") { proxyFormDirty=false; fillProxyForm(true); loadNodes().catch(e=>showToast(e.message,true)); } if(screen==="settings"){fillSettings(); loadSettingsSecrets().catch(e=>showToast(e.message,true));}
 }
-async function saveSlot() { try { const mode=document.querySelector('[name="switch-mode"]:checked')?.value||"auto"; await api("slots/update",{method:"POST",body:JSON.stringify({slot:currentSlot,preferred_country:$("preferred-country").value,routing_ip_type:$("routing-ip-type").value,switch_mode:mode,enabled:$("slot-enabled").checked})}); proxyFormDirty=false; showToast("代理配置已保存，调度器正在应用"); await loadDashboard(false,{forceForms:true}); fillProxyNodeFilters(true); renderNodes(); } catch(e){showToast(e.message,true);} }
+async function saveSlot() { try { const mode=document.querySelector('[name="switch-mode"]:checked')?.value||"auto"; await api("slots/update",{method:"POST",body:JSON.stringify({slot:currentSlot,preferred_country:$("preferred-country").value,routing_ip_type:$("routing-ip-type").value,switch_mode:mode,enabled:$("slot-enabled").checked})}); proxyFormDirty=false; showToast("代理配置已保存，调度器正在应用"); await loadDashboard(false,{forceForms:true}); renderNodes(); } catch(e){showToast(e.message,true);} }
 async function connectNode(nodeId) { try { showToast(`代理 ${currentSlot} 正在建立隧道...`); await api("slots/connect",{method:"POST",body:JSON.stringify({slot:currentSlot,node_id:nodeId})}); await loadDashboard(); await loadNodes(); showToast("连接成功"); } catch(e){showToast(e.message,true);} }
 async function testNode(nodeId) {
   const epoch=++singleNodeTestEpoch;
@@ -338,12 +421,12 @@ function updateNodeRepository(button) { nodeUpdateEpoch+=1; return runNodeMainte
 function testCachedNodes(button) { return runNodeMaintenance(button,"nodes/test-cache","缓存池连接测试完成","正在测试…",nodeUpdateEpoch); }
 function fillSettings(force=false) {
   if(!dashboard)return;
-  $("node-cache-status").textContent=`当前占用 ${dashboard.node_cache_count||0} / ${dashboard.node_cache_size||150}`;
+  $("node-cache-status").textContent=`当前占用 ${dashboard.node_cache_count||0}；每地区最多 ${dashboard.region_node_limit||10}`;
   if(!force && (settingsDirty || isSettingsFormActive()))return;
   $("admin-username").value=dashboard.username||"";
   $("secret-path").value=dashboard.secret_path||"";
   $("proxy-username").value=dashboard.proxy_username||"";
-  $("node-cache-size").value=dashboard.node_cache_size||150;
+  $("region-node-limit").value=dashboard.region_node_limit||10;
   if(!force) {
     settingsSavedUsername=dashboard.username||settingsSavedUsername;
     settingsSavedSecretPath=dashboard.secret_path||settingsSavedSecretPath;
@@ -358,10 +441,11 @@ async function loadSettingsSecrets(force=false) {
     dashboard.username=data.username||"";
     dashboard.secret_path=data.secret_path||"";
     dashboard.proxy_username=data.proxy_username||"";
-    dashboard.node_cache_size=data.node_cache_size||150;
+    dashboard.node_cache_size=data.node_cache_size||0;
+    dashboard.region_node_limit=data.region_node_limit||10;
     dashboard.node_cache_count=data.node_cache_count||0;
   }
-  $("node-cache-status").textContent=`当前占用 ${data.node_cache_count||0} / ${data.node_cache_size||150}`;
+  $("node-cache-status").textContent=`当前占用 ${data.node_cache_count||0}；每地区最多 ${data.region_node_limit||10}`;
   if(!force && (settingsDirty || isSettingsFormActive()))return;
   $("current-admin-password").value="";
   $("admin-password").value="";
@@ -370,7 +454,7 @@ async function loadSettingsSecrets(force=false) {
   $("secret-path").value=data.secret_path||"";
   $("proxy-username").value=data.proxy_username||"";
   $("proxy-password").value=data.proxy_password||"";
-  $("node-cache-size").value=data.node_cache_size||150;
+  $("region-node-limit").value=data.region_node_limit||10;
   settingsDirty=false;
 }
 function toggleSecretInput(id) {
@@ -413,7 +497,7 @@ async function saveSettings() {
         secret_path:$("secret-path").value,
         proxy_username:$("proxy-username").value,
         proxy_password:$("proxy-password").value,
-        node_cache_size:Number($("node-cache-size").value)
+        region_node_limit:Number($("region-node-limit").value)
       })
     });
     if(data.reauth_required){
@@ -427,15 +511,27 @@ async function saveSettings() {
   } catch(e){showToast(e.message,true);}
 }
 
+function logLevelText(level) { return ({INFO:"信息",WARNING:"警告",ERROR:"错误"})[level]||level||"信息"; }
+async function loadLogs(quiet=false) {
+  const params=new URLSearchParams({limit:"1000"});
+  const level=$("log-level").value, search=$("log-search").value.trim();
+  if(level)params.set("level",level); if(search)params.set("search",search);
+  try {
+    const data=await api(`logs?${params}`), entries=data.logs||[];
+    $("log-count").textContent=`${entries.length} 条日志`;
+    $("log-list").innerHTML=entries.length?entries.map(entry=>`<article class="log-entry level-${esc(String(entry.level||"info").toLowerCase())}"><time>${esc(entry.timestamp||"-")}</time><span class="log-level">${esc(logLevelText(entry.level))}</span><strong>${esc(entry.module||"System")}</strong><span class="log-thread">${esc(entry.thread||"")}</span><p>${esc(entry.message||"")}</p></article>`).join(""):'<div class="empty">没有符合条件的日志</div>';
+    $("log-list").scrollTop=$("log-list").scrollHeight;
+  } catch(error) { if(!quiet)throw error; }
+}
+
 // ===== Custom dropdown widget (keeps native select values/events) =====
 let customSelectSerial = 0;
 const CUSTOM_SELECT_LABELS = {
   "all-node-country":"节点地区筛选",
   "all-node-type":"节点 IP 类型筛选",
   "all-node-status":"节点状态筛选",
-  "node-country":"代理节点地区筛选",
-  "node-ip-type":"代理节点 IP 类型筛选",
-  "node-status":"代理节点状态筛选"
+  "node-status":"代理节点状态筛选",
+  "log-level":"日志级别筛选"
 };
 function countryCountMap() {
   const map = {};
@@ -710,8 +806,8 @@ window.addEventListener("scroll",event=>{
 window.addEventListener("resize",()=>closeAllSelects());
 
 document.querySelectorAll("[data-screen]").forEach(button=>button.onclick=()=>showScreen(button.dataset.screen));
-$("reload").onclick=async()=>{await loadDashboard(false,{forceForms:true});if(currentScreen==="nodes")await loadAllNodes();if(currentScreen==="proxy")await loadNodes();if(currentScreen==="settings")await loadSettingsSecrets(true);};
-$("save-slot").onclick=saveSlot; $("node-search").oninput=renderNodes; $("node-country").onchange=renderNodes; $("node-ip-type").onchange=renderNodes; $("node-status").onchange=renderNodes;
+$("reload").onclick=async()=>{await loadDashboard(false,{forceForms:true});if(currentScreen==="nodes")await loadAllNodes();if(currentScreen==="proxy")await loadNodes();if(currentScreen==="logs")await loadLogs();if(currentScreen==="settings")await loadSettingsSecrets(true);};
+$("save-slot").onclick=saveSlot; $("node-search").oninput=renderNodes; $("node-status").onchange=renderNodes;
 $("all-node-search").oninput=renderAllNodes; $("all-node-country").onchange=renderAllNodes; $("all-node-type").onchange=renderAllNodes; $("all-node-status").onchange=renderAllNodes;
 settingsInputIds().forEach(id=>$(id).addEventListener("input",()=>{settingsDirty=true;}));
 document.querySelectorAll("[data-toggle-secret]").forEach(button=>button.onclick=()=>toggleSecretInput(button.dataset.toggleSecret));
@@ -720,6 +816,7 @@ document.querySelectorAll("[data-copy-secret]").forEach(button=>button.onclick=(
   $(id).addEventListener("input",()=>{proxyFormDirty=true;});
   $(id).addEventListener("change",()=>{proxyFormDirty=true;});
 });
+[$("preferred-country"),$("routing-ip-type")].forEach(input=>input.addEventListener("change",renderNodes));
 document.querySelectorAll('[name="switch-mode"]').forEach(input=>input.addEventListener("change",()=>{proxyFormDirty=true;}));
 $("refresh-all-nodes").onclick=()=>updateNodeRepository($("refresh-all-nodes"));
 $("test-cache-nodes").onclick=()=>testCachedNodes($("test-cache-nodes"));
@@ -728,6 +825,10 @@ $("disconnect-proxy").onclick=async()=>{try{await api("slots/disconnect",{method
 $("test-proxy").onclick=async()=>{try{const d=await api("slots/test",{method:"POST",body:JSON.stringify({slot:currentSlot})});showToast(`出口 ${d.ip}，延迟 ${d.latency_ms} ms`);await loadDashboard(true,{heartbeat:true});}catch(e){showToast(e.message,true);}};
 $("save-settings").onclick=saveSettings; $("mobile-menu").onclick=()=>$("sidebar").classList.toggle("open");
 $("reset-traffic").onclick=resetTraffic;
+$("refresh-logs").onclick=()=>loadLogs().catch(e=>showToast(e.message,true));
+$("log-level").onchange=()=>loadLogs().catch(e=>showToast(e.message,true));
+let logSearchTimer=null; $("log-search").oninput=()=>{clearTimeout(logSearchTimer);logSearchTimer=setTimeout(()=>loadLogs(true),300);};
 $("logout").onclick=async()=>{try{await api("logout",{method:"POST",body:"{}"});}finally{location.reload();}};
 enhanceAllSelects();
-loadDashboard().then(()=>showScreen("system")); setInterval(()=>loadDashboard(true,{heartbeat:true}),5000); setInterval(()=>loadTraffic(),2000);
+initializeResizableTables();
+loadDashboard().then(()=>showScreen("system")); setInterval(()=>loadDashboard(true,{heartbeat:true}),5000); setInterval(()=>loadTraffic(),2000); setInterval(()=>{if(currentScreen==="logs"&&$("log-auto-refresh").checked)loadLogs(true);},3000);

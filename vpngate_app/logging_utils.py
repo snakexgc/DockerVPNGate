@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import DATA_DIR
 
@@ -40,9 +41,50 @@ def log_to_json(level: str, module: str, message: str) -> None:
         logs_dir = DATA_DIR / "logs"
         logs_dir.mkdir(exist_ok=True, parents=True)
         log_file = logs_dir / f"{time.strftime('%Y-%m-%d', time.localtime())}.json"
-        entry = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "level": level, "module": module, "message": message}
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "epoch": round(time.time(), 3),
+            "level": str(level or "INFO").upper(),
+            "module": str(module or "System"),
+            "thread": threading.current_thread().name,
+            "message": str(message),
+        }
         with _lock, open(log_file, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         cleanup_old_logs(logs_dir)
     except Exception as exc:
         print(f"[Log Error] Failed to write JSON log: {exc}", flush=True)
+
+
+def read_log_entries(limit: int = 500, level: str = "", search: str = "") -> list[dict[str, Any]]:
+    """Read recent structured logs safely, newest files last in the response."""
+    limit = max(1, min(2000, int(limit)))
+    requested_level = str(level or "").upper()
+    needle = str(search or "").casefold()
+    logs_dir = DATA_DIR / "logs"
+    matches: list[dict[str, Any]] = []
+    try:
+        paths = sorted(logs_dir.glob("*.json"), reverse=True)
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if requested_level and str(entry.get("level") or "").upper() != requested_level:
+                    continue
+                haystack = " ".join(str(entry.get(key) or "") for key in ("module", "thread", "message")).casefold()
+                if needle and needle not in haystack:
+                    continue
+                matches.append(entry)
+                if len(matches) >= limit:
+                    return list(reversed(matches))
+        return list(reversed(matches))
+    except OSError:
+        return []
