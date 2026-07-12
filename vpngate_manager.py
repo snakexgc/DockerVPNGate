@@ -298,6 +298,14 @@ def configured_fixed_node_ids(config: dict[str, Any] | None = None) -> set[str]:
     }
 
 
+def node_matches_ip_type(node: dict[str, Any], ip_type: str) -> bool:
+    if ip_type == "residential":
+        return node.get("ip_type") in ("residential", "mobile")
+    if ip_type == "hosting":
+        return node.get("ip_type") == "hosting"
+    return True
+
+
 def slot_candidates(index: int, country_filter: str = "") -> list[dict[str, Any]]:
     config = load_ui_config()["proxy_slots"][index]
     ip_type = str(config.get("routing_ip_type") or "all")
@@ -314,9 +322,7 @@ def slot_candidates(index: int, country_filter: str = "") -> list[dict[str, Any]
             continue
         if node.get("latency_source") != LATENCY_SOURCE or parse_int(node.get("latency_ms")) <= 0:
             continue
-        if ip_type == "residential" and node.get("ip_type") not in ("residential", "mobile"):
-            continue
-        if ip_type == "hosting" and node.get("ip_type") != "hosting":
+        if not node_matches_ip_type(node, ip_type):
             continue
         if country_filter and not country_matches(node.get("country"), country_filter):
             continue
@@ -432,11 +438,10 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
             node["probed_at"] = time.time()
             write_json(NODES_FILE, sort_all_nodes(nodes))
             raise RuntimeError(latency_message)
-        node["latency_ms"] = latency
-        node["latency_source"] = LATENCY_SOURCE
         node["probe_status"] = NODE_STATUS_AVAILABLE
-        node["probe_message"] = latency_message
-        node["probed_at"] = time.time()
+        # Keep the comparable latency from the latest full-pool Google 204 test.
+        # The just-connected tunnel latency belongs to this active slot only and
+        # is exposed through runtime.proxy_latency_ms below.
         write_json(NODES_FILE, sort_all_nodes(nodes))
         runtime.update(
             proxy_ok=True,
@@ -582,7 +587,12 @@ def ensure_proxy_slot(index: int) -> None:
         return
 
     preferred_country = str(config.get("preferred_country") or "").strip()
-    current_matches = bool(current and (not preferred_country or country_matches(current.get("country"), preferred_country)))
+    ip_type = str(config.get("routing_ip_type") or "all")
+    current_matches = bool(
+        current
+        and (not preferred_country or country_matches(current.get("country"), preferred_country))
+        and node_matches_ip_type(current, ip_type)
+    )
     if slot_process_running(index) and current_matches:
         proxy_slots_runtime[index]["using_fallback"] = False
         return
@@ -1040,12 +1050,20 @@ def update_active_node_latency(index: int, latency: int, message: str) -> None:
     current_nodes = read_nodes()
     for node in current_nodes:
         if str(node.get("id") or "") == node_id:
-            node["latency_ms"] = latency
-            node["latency_source"] = LATENCY_SOURCE
-            node["probe_status"] = NODE_STATUS_AVAILABLE
-            node["probe_message"] = message
-            node["probed_at"] = time.time()
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            # Pool latencies must remain from the same batch test so candidates
+            # stay comparable. Only repair legacy/missing probe data here; the
+            # active slot's live latency is kept in proxy_slots_runtime.
+            if (
+                node.get("probe_status") != NODE_STATUS_AVAILABLE
+                or node.get("latency_source") != LATENCY_SOURCE
+                or parse_int(node.get("latency_ms")) <= 0
+            ):
+                node["latency_ms"] = latency
+                node["latency_source"] = LATENCY_SOURCE
+                node["probe_status"] = NODE_STATUS_AVAILABLE
+                node["probe_message"] = message
+                node["probed_at"] = time.time()
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
             return
 
 

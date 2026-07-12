@@ -542,6 +542,115 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual([node["id"] for node in candidates], ["japan-fast", "japan-slow"])
 
+    def test_residential_candidates_exclude_hosting_and_use_lowest_latency(self) -> None:
+        config = self._proxy_config()
+        config["proxy_slots"][0]["routing_ip_type"] = "residential"
+        nodes = [
+            {
+                "id": "hosting-fastest",
+                "country": "Japan",
+                "ip_type": "hosting",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 5,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+            {
+                "id": "residential-slow",
+                "country": "Japan",
+                "ip_type": "residential",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 60,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+            {
+                "id": "mobile-fast",
+                "country": "Japan",
+                "ip_type": "mobile",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 30,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+                "score": 100,
+            },
+        ]
+        with (
+            patch.object(vpngate_manager, "load_ui_config", return_value=config),
+            patch.object(vpngate_manager, "read_nodes", return_value=nodes),
+            patch.object(vpngate_manager, "used_node_ids", return_value=set()),
+        ):
+            candidates = vpngate_manager.slot_candidates(0, "Japan")
+
+        self.assertEqual([node["id"] for node in candidates], ["mobile-fast", "residential-slow"])
+
+    def test_auto_mode_replaces_running_node_that_no_longer_matches_ip_type(self) -> None:
+        old_done = vpngate_manager.initial_node_pool_test_done
+        old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
+        try:
+            vpngate_manager.initial_node_pool_test_done = True
+            current = {
+                "id": "current-hosting",
+                "country": "Japan",
+                "ip_type": "hosting",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 10,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+            }
+            replacement = {
+                "id": "replacement-mobile",
+                "country": "Japan",
+                "ip_type": "mobile",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 30,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+            }
+            config = self._proxy_config()
+            config["proxy_slots"][0].update(
+                preferred_country="Japan",
+                routing_ip_type="residential",
+            )
+            vpngate_manager.proxy_slots_runtime[0].update(
+                active_node_id="current-hosting",
+                connecting=False,
+                switch_country="",
+            )
+            with (
+                patch.object(vpngate_manager, "load_ui_config", return_value=config),
+                patch.object(vpngate_manager, "node_for_runtime", return_value=current),
+                patch.object(vpngate_manager, "slot_process_running", return_value=True),
+                patch.object(vpngate_manager, "slot_candidates", return_value=[replacement]),
+                patch.object(vpngate_manager, "connect_proxy_slot") as mocked_connect,
+            ):
+                vpngate_manager.ensure_proxy_slot(0)
+
+            mocked_connect.assert_called_once_with(0, "replacement-mobile")
+        finally:
+            vpngate_manager.initial_node_pool_test_done = old_done
+            vpngate_manager.proxy_slots_runtime[0].clear()
+            vpngate_manager.proxy_slots_runtime[0].update(old_runtime)
+
+    def test_active_health_latency_does_not_overwrite_batch_pool_latency(self) -> None:
+        old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
+        try:
+            vpngate_manager.proxy_slots_runtime[0]["active_node_id"] = "active"
+            nodes = [{
+                "id": "active",
+                "probe_status": NODE_STATUS_AVAILABLE,
+                "latency_ms": 25,
+                "latency_source": vpngate_manager.LATENCY_SOURCE,
+            }]
+            with (
+                patch.object(vpngate_manager, "read_nodes", return_value=nodes),
+                patch.object(vpngate_manager, "write_json") as mocked_write,
+            ):
+                vpngate_manager.update_active_node_latency(0, 900, "live check")
+
+            self.assertEqual(nodes[0]["latency_ms"], 25)
+            mocked_write.assert_not_called()
+        finally:
+            vpngate_manager.proxy_slots_runtime[0].clear()
+            vpngate_manager.proxy_slots_runtime[0].update(old_runtime)
+
     def test_auto_switch_uses_lowest_latency_node_in_failed_region(self) -> None:
         old_done = vpngate_manager.initial_node_pool_test_done
         old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
