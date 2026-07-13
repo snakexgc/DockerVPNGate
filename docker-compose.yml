@@ -2,7 +2,7 @@ name: dockervpngate
 
 services:
   dockervpngate:
-    image: dockervpngate:local
+    image: ${DOCKERVPNGATE_IMAGE:-ghcr.io/snakexgc/dockervpngate:latest}
     build:
       context: .
     container_name: DockerVPNGate
