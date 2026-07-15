@@ -79,9 +79,12 @@ from vpngate_app.web_api import create_handler
 
 from vpngate_app.config import (
     API_URL, AUTH_FILE, BLACKLIST_FILE, CHECK_INTERVAL_SECONDS, CONFIG_DIR, DATA_DIR,
-    DEFAULT_REGION_NODE_LIMIT, INITIAL_CONNECT_TEST_LIMIT,
+    DEFAULT_MAX_SCAN_ROWS, DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+    DEFAULT_NODE_TEST_WORKERS, DEFAULT_REGION_NODE_LIMIT, INITIAL_CONNECT_TEST_LIMIT,
     INVALID_BACKOFF_SECONDS, LOCAL_PROXY_HOST, MANUAL_TEST_NODE_LIMIT,
-    MAX_REGION_NODE_LIMIT, MAX_SCAN_ROWS, MIN_REGION_NODE_LIMIT, NODES_FILE,
+    MAX_NODE_AUTO_RETEST_SECONDS_PER_NODE, MAX_NODE_TEST_WORKERS, MAX_REGION_NODE_LIMIT,
+    MAX_SCAN_ROWS_LIMIT, MIN_NODE_AUTO_RETEST_SECONDS_PER_NODE, MIN_NODE_TEST_WORKERS,
+    MIN_REGION_NODE_LIMIT, MIN_SCAN_ROWS, NODES_FILE,
     OPENVPN_AUTH_PASS, OPENVPN_AUTH_USER, OPENVPN_CMD, OPENVPN_TEST_TIMEOUT_SECONDS,
     PROXY_INTERFACES, PROXY_PORTS, ROOT_DIR, STATE_FILE, UI_HOST, UI_PORT,
     UPSTREAM_PROXY_AUTH_FILE, WEB_DIR, env_int,
@@ -94,6 +97,7 @@ from vpngate_app.node_testing import (
     LATENCY_SOURCE, NODE_STATUS_AVAILABLE, NODE_STATUS_NOT_CHECKED, NODE_STATUS_QUEUED,
     NODE_STATUS_TESTING, NODE_STATUS_UNAVAILABLE, NodeTestCancelled, cancel_active_node_tests,
     configure_backend as configure_node_testing, country_matches,
+    batch_probe_statuses,
     measure_proxy_http_latency, migrate_legacy_node_latencies,
     node_test_is_active, normalized_country_name,
     sort_all_nodes, test_multiple_nodes, test_node_by_id,
@@ -146,10 +150,7 @@ last_collector_heartbeat = 0.0
 initial_node_pool_test_done = False
 server_start_time = time.time()
 vpn_operation_lock = threading.Lock()
-NODE_TEST_BATCH_SIZE = env_int("NODE_TEST_BATCH_SIZE", 8, 1, 20)
-NODE_TEST_WORKERS = 8
 PENDING_NODE_TEST_RETRY_SECONDS = env_int("PENDING_NODE_TEST_RETRY_SECONDS", 10, 1, 300)
-NODE_AUTO_RETEST_SECONDS_PER_NODE = env_int("NODE_AUTO_RETEST_SECONDS_PER_NODE", 10, 1, 3600)
 ACTIVE_PROXY_GOOGLE204_INTERVAL_SECONDS = env_int("ACTIVE_PROXY_GOOGLE204_INTERVAL_SECONDS", 30, 1, 3600)
 ACTIVE_PROXY_GOOGLE204_TIMEOUT_LIMIT = env_int("ACTIVE_PROXY_GOOGLE204_TIMEOUT_LIMIT", 5, 1, 100)
 PENDING_NODE_PROBE_STATUSES = (None, NODE_STATUS_QUEUED, NODE_STATUS_NOT_CHECKED, NODE_STATUS_TESTING)
@@ -163,6 +164,26 @@ node_refresh_pending = threading.Event()
 node_test_start_pending = threading.Event()
 
 
+def configured_node_test_workers(config: dict[str, Any] | None = None) -> int:
+    config = config or load_ui_config()
+    return int(config.get("node_test_workers", DEFAULT_NODE_TEST_WORKERS))
+
+
+def configured_max_scan_rows(config: dict[str, Any] | None = None) -> int:
+    config = config or load_ui_config()
+    return int(config.get("max_scan_rows", DEFAULT_MAX_SCAN_ROWS))
+
+
+def configured_node_retest_seconds(config: dict[str, Any] | None = None) -> int:
+    config = config or load_ui_config()
+    return int(
+        config.get(
+            "node_auto_retest_seconds_per_node",
+            DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+        )
+    )
+
+
 def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
@@ -174,6 +195,7 @@ configure_node_testing(sys.modules[__name__])
 
 def get_state() -> dict[str, Any]:
     state = read_json(STATE_FILE, {})
+    config = load_ui_config()
     state.pop("password", None)
     state["maintenance_running"] = (
         maintenance_lock.locked()
@@ -182,7 +204,9 @@ def get_state() -> dict[str, Any]:
         or node_test_batch_active
     )
     state.setdefault("api_url", API_URL)
-    state["fetch_interval_seconds"] = node_pool_retest_interval_seconds()
+    state["fetch_interval_seconds"] = node_pool_retest_interval_seconds(
+        seconds_per_node=configured_node_retest_seconds(config)
+    )
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     state["proxy_ports"] = list(PROXY_PORTS)
     state.setdefault("last_fetch_status", "not_started")
@@ -306,11 +330,16 @@ def node_matches_ip_type(node: dict[str, Any], ip_type: str) -> bool:
     return True
 
 
-def slot_candidates(index: int, country_filter: str = "") -> list[dict[str, Any]]:
-    config = load_ui_config()["proxy_slots"][index]
-    ip_type = str(config.get("routing_ip_type") or "all")
+def slot_candidates(
+    index: int,
+    country_filter: str = "",
+    nodes: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    slot_config = (config or load_ui_config())["proxy_slots"][index]
+    ip_type = str(slot_config.get("routing_ip_type") or "all")
     used = used_node_ids(index)
-    nodes = read_nodes()
+    nodes = read_nodes() if nodes is None else nodes
     used_countries = {
         normalized_country_name(node.get("country"))
         for node in nodes
@@ -499,6 +528,7 @@ def check_proxy_slot_health(index: int) -> dict[str, Any]:
 
 def node_probe_progress_text(nodes: list[dict[str, Any]] | None = None) -> str:
     nodes = read_nodes() if nodes is None else nodes
+    live_statuses = batch_probe_statuses()
     tracked_nodes = [node for node in nodes if node.get("id")]
     total = len(tracked_nodes)
     if not total:
@@ -509,7 +539,7 @@ def node_probe_progress_text(nodes: list[dict[str, Any]] | None = None) -> str:
     available = 0
     unavailable = 0
     for node in tracked_nodes:
-        status = node.get("probe_status")
+        status = live_statuses.get(str(node.get("id") or ""), node.get("probe_status"))
         if status == NODE_STATUS_TESTING:
             testing += 1
         elif status == NODE_STATUS_AVAILABLE:
@@ -544,23 +574,29 @@ def auto_proxy_connection_wait_reason() -> str:
     return ""
 
 
-def ensure_proxy_slot(index: int) -> None:
+def ensure_proxy_slot(
+    index: int,
+    nodes: list[dict[str, Any]] | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
     if proxy_slots_runtime[index].get("connecting"):
         return
-    config = load_ui_config()["proxy_slots"][index]
-    if not config.get("enabled", True):
+    ui_config = config or load_ui_config()
+    slot_config = ui_config["proxy_slots"][index]
+    if not slot_config.get("enabled", True):
         if slot_process_running(index):
             stop_proxy_slot(index, "已在面板中停用")
         return
-    current = node_for_runtime(index)
+    nodes = read_nodes() if nodes is None else nodes
+    current = node_for_runtime(index, nodes)
     wait_reason = auto_proxy_connection_wait_reason()
     if wait_reason:
         if not slot_process_running(index):
             proxy_slots_runtime[index]["error"] = wait_reason
         return
-    switch_mode = str(config.get("switch_mode") or "auto")
+    switch_mode = str(slot_config.get("switch_mode") or "auto")
     if switch_mode == "fixed":
-        fixed_node_id = str(config.get("last_node_id") or "")
+        fixed_node_id = str(slot_config.get("last_node_id") or "")
         if slot_process_running(index) and current and current.get("id") == fixed_node_id:
             proxy_slots_runtime[index]["using_fallback"] = False
             return
@@ -569,7 +605,7 @@ def ensure_proxy_slot(index: int) -> None:
         if not fixed_node_id:
             proxy_slots_runtime[index]["error"] = "固定选中模式尚未选择节点"
             return
-        fixed_node = next((node for node in read_nodes() if node.get("id") == fixed_node_id), None)
+        fixed_node = next((node for node in nodes if node.get("id") == fixed_node_id), None)
         if fixed_node is None:
             proxy_slots_runtime[index]["error"] = "固定节点不在缓存池中，请重新选择"
             return
@@ -586,8 +622,8 @@ def ensure_proxy_slot(index: int) -> None:
             print(f"[代理 {index + 1}] 固定节点 {fixed_node_id} 连接失败: {exc}", flush=True)
         return
 
-    preferred_country = str(config.get("preferred_country") or "").strip()
-    ip_type = str(config.get("routing_ip_type") or "all")
+    preferred_country = str(slot_config.get("preferred_country") or "").strip()
+    ip_type = str(slot_config.get("routing_ip_type") or "all")
     current_matches = bool(
         current
         and (not preferred_country or country_matches(current.get("country"), preferred_country))
@@ -600,9 +636,9 @@ def ensure_proxy_slot(index: int) -> None:
     switch_country = str(proxy_slots_runtime[index].get("switch_country") or "").strip()
     current_country = str(current.get("country") or "").strip() if current else ""
     target_country = preferred_country or switch_country or current_country
-    candidates = slot_candidates(index, target_country)
+    candidates = slot_candidates(index, target_country, nodes, ui_config)
     if not candidates and target_country:
-        candidates = slot_candidates(index)
+        candidates = slot_candidates(index, nodes=nodes, config=ui_config)
     if slot_process_running(index) and current and candidates and candidates[0].get("id") == current.get("id"):
         proxy_slots_runtime[index]["using_fallback"] = bool(
             preferred_country and not country_matches(current.get("country"), preferred_country)
@@ -696,16 +732,20 @@ def multi_dashboard_state() -> dict[str, Any]:
     nodes = read_nodes()
     config = load_ui_config()
     state = read_json(STATE_FILE, {})
+    country_choices = country_choice_payloads(nodes)
+    node_test_workers = configured_node_test_workers(config)
+    max_scan_rows = configured_max_scan_rows(config)
+    node_retest_seconds = configured_node_retest_seconds(config)
     return {
         "slots": [proxy_slot_payload(index, nodes, config) for index in range(len(PROXY_PORTS))],
-        "countries": country_choice_payloads(nodes),
+        "countries": country_choices,
         "node_count": len(nodes),
         "region_node_limit": int(config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT)),
-        "node_cache_size": len(country_choice_payloads(nodes)) * int(
+        "node_cache_size": len(country_choices) * int(
             config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT)
         ),
         "node_cache_count": len(nodes),
-        "fetch_interval_seconds": node_pool_retest_interval_seconds(len(nodes)),
+        "fetch_interval_seconds": node_pool_retest_interval_seconds(len(nodes), node_retest_seconds),
         "last_fetch_at": state.get("last_fetch_at", 0),
         "last_fetch_candidate_count": state.get("last_fetch_candidate_count", 0),
         "available_node_count": sum(1 for node in nodes if node.get("probe_status") == NODE_STATUS_AVAILABLE),
@@ -716,7 +756,9 @@ def multi_dashboard_state() -> dict[str, Any]:
             or node_test_batch_active
         ),
         "node_test_running": node_test_is_active(),
-        "node_test_workers": NODE_TEST_WORKERS,
+        "node_test_workers": node_test_workers,
+        "max_scan_rows": max_scan_rows,
+        "node_auto_retest_seconds_per_node": node_retest_seconds,
         "node_refresh_pending": node_refresh_pending.is_set(),
         "username": config.get("username", ""),
         "secret_path": config.get("secret_path", ""),
@@ -734,9 +776,13 @@ def public_nodes_for_slot(index: int) -> list[dict[str, Any]]:
         for slot_index, runtime in enumerate(proxy_slots_runtime)
         if runtime.get("active_node_id") and slot_process_running(slot_index)
     }
+    live_statuses = batch_probe_statuses()
     result = []
     for node in read_nodes():
         public = {key: value for key, value in node.items() if key not in ("config_text", "config_file")}
+        node_id = str(node.get("id") or "")
+        if node_id in live_statuses:
+            public["probe_status"] = live_statuses[node_id]
         public["active_proxy"] = active_by_node.get(str(node.get("id")), 0)
         public["country_label"] = normalized_country_name(node.get("country"))
         result.append(public)
@@ -988,13 +1034,16 @@ def resize_node_cache_when_idle(capacity: int) -> None:
         resize_node_cache(capacity)
 
 
-def node_pool_retest_interval_seconds(node_count: int | None = None) -> int:
+def node_pool_retest_interval_seconds(
+    node_count: int | None = None,
+    seconds_per_node: int = DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+) -> int:
     if node_count is None:
         try:
             node_count = len(read_nodes())
         except Exception:
             node_count = 0
-    return max(1, int(node_count or 0)) * NODE_AUTO_RETEST_SECONDS_PER_NODE
+    return max(1, int(node_count or 0)) * max(1, int(seconds_per_node))
 
 
 def google204_failure_is_timeout(message: Any) -> bool:
@@ -1128,6 +1177,7 @@ def continue_pending_node_tests(wait: bool = False) -> str:
             return "节点更新任务正在等待执行，暂不续测排队节点"
 
         config = load_ui_config()
+        worker_count = configured_node_test_workers(config)
         preferred = [str(slot.get("preferred_country") or "") for slot in config["proxy_slots"]]
         nodes = read_nodes()
         node_ids = probe_candidate_node_ids(nodes, preferred)
@@ -1138,9 +1188,9 @@ def continue_pending_node_tests(wait: bool = False) -> str:
                 initial_node_pool_test_done = True
             return message
 
-        set_state(last_check_message=f"发现 {len(node_ids)} 个排队节点，继续使用 8 线程检测...")
+        set_state(last_check_message=f"发现 {len(node_ids)} 个排队节点，继续使用 {worker_count} 线程检测...")
         with vpn_operation_lock:
-            test_multiple_nodes(node_ids)
+            test_multiple_nodes(node_ids, worker_count)
 
         for index in range(len(PROXY_PORTS)):
             ensure_proxy_slot(index)
@@ -1172,18 +1222,20 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
     try:
         last_collector_heartbeat = time.time()
         existing_snapshot = read_nodes()
+        config = load_ui_config()
+        worker_count = configured_node_test_workers(config)
+        max_scan_rows = configured_max_scan_rows(config)
         set_state(last_check_message="正在获取 VPNGate 节点列表；新旧节点全部测试后再按地区更新节点池...")
         fetched: list[dict[str, Any]] = []
         fetch_error: Exception | None = None
         try:
-            fetched = fetch_candidates()
+            fetched = fetch_candidates(max_scan_rows)
         except Exception as exc:
             fetch_error = exc
             if not existing_snapshot:
                 raise
             log_to_json("WARNING", "NodePool", f"节点拉取失败，保留本地节点池并继续启动检测: {exc}")
             set_state(last_check_message=f"节点拉取失败，保留 {len(existing_snapshot)} 个本地节点并进行连接测试...")
-        config = load_ui_config()
         region_limit = int(config.get("region_node_limit", DEFAULT_REGION_NODE_LIMIT))
         staged_refresh = bool(fetched)
         if staged_refresh:
@@ -1208,7 +1260,7 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         )
         if node_ids:
             with vpn_operation_lock:
-                test_multiple_nodes(node_ids)
+                test_multiple_nodes(node_ids, worker_count)
         if staged_refresh:
             protected_ids = used_node_ids() | configured_fixed_node_ids(config)
             finalized, stats = merge_node_cache([], read_nodes(), region_limit, protected_ids)
@@ -1241,7 +1293,7 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
             )
         else:
             suffix = f"；API 拉取失败但本地池已保留 ({fetch_error})" if fetch_error else ""
-            message = f"节点维护完成：{len(current_nodes)} 个节点均已由 8 个工作线程检测{suffix}"
+            message = f"节点维护完成：{len(current_nodes)} 个节点均已由 {worker_count} 个工作线程检测{suffix}"
         set_state(last_check_message=message)
         return message
     except NodeTestCancelled:
@@ -1264,15 +1316,17 @@ def test_cached_node_pool() -> str:
     try:
         if node_refresh_pending.is_set():
             return "连接测试已让路给更新节点"
+        config = load_ui_config()
+        worker_count = configured_node_test_workers(config)
         nodes = read_nodes()
         node_ids = [
             str(node.get("id")) for node in nodes
             if node.get("id")
         ]
-        set_state(last_check_message=f"正在测试缓存池连接：共 {len(node_ids)} 个节点，8 线程并发执行")
+        set_state(last_check_message=f"正在测试缓存池连接：共 {len(node_ids)} 个节点，{worker_count} 线程并发执行")
         if node_ids:
             with vpn_operation_lock:
-                test_multiple_nodes(node_ids)
+                test_multiple_nodes(node_ids, worker_count)
         for index in range(len(PROXY_PORTS)):
             ensure_proxy_slot(index)
         current_nodes = read_nodes()
@@ -1412,7 +1466,14 @@ def multi_collector_loop() -> None:
         except Exception as exc:
             print(f"[多代理节点维护] {exc}", flush=True)
             set_state(last_check_message=f"节点维护失败: {exc}")
-        delay = PENDING_NODE_TEST_RETRY_SECONDS if pending_probe_count() else node_pool_retest_interval_seconds()
+        config = load_ui_config()
+        delay = (
+            PENDING_NODE_TEST_RETRY_SECONDS
+            if pending_probe_count()
+            else node_pool_retest_interval_seconds(
+                seconds_per_node=configured_node_retest_seconds(config)
+            )
+        )
         time.sleep(delay)
 
 
@@ -1420,13 +1481,18 @@ def multi_proxy_monitor() -> None:
     while True:
         try:
             nodes = read_nodes()
+            config = load_ui_config()
             for index in range(len(PROXY_PORTS)):
                 runtime = proxy_slots_runtime[index]
                 if runtime.get("connecting"):
                     continue
-                if slot_process_running(index):
+                was_running = slot_process_running(index)
+                if was_running:
                     run_active_proxy_google204_check(index, nodes)
-                ensure_proxy_slot(index)
+                if was_running and not slot_process_running(index):
+                    # A failed health check may have changed the node status on disk.
+                    nodes = read_nodes()
+                ensure_proxy_slot(index, nodes, config)
         except Exception as exc:
             print(f"[多代理守护] {exc}", flush=True)
         time.sleep(1)
@@ -1455,6 +1521,8 @@ def main() -> None:
         signal.signal(signal.SIGINT, shutdown_handler)
 
     ui_config = load_ui_config()
+    worker_count = configured_node_test_workers(ui_config)
+    node_retest_seconds = configured_node_retest_seconds(ui_config)
     proxy_server.set_proxy_credentials(
         str(ui_config.get("proxy_username") or ""),
         str(ui_config.get("proxy_password") or ""),
@@ -1464,10 +1532,10 @@ def main() -> None:
         {
             "api_url": API_URL,
             "proxy_ports": list(PROXY_PORTS),
-            "fetch_interval_seconds": node_pool_retest_interval_seconds(0),
+            "fetch_interval_seconds": node_pool_retest_interval_seconds(0, node_retest_seconds),
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
             "last_fetch_status": "starting",
-            "last_check_message": "服务已启动，正在获取并使用 8 个工作线程检测 VPN 节点...",
+            "last_check_message": f"服务已启动，正在获取并使用 {worker_count} 个工作线程检测 VPN 节点...",
         },
     )
 

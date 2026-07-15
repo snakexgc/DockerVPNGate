@@ -348,7 +348,8 @@ def row_to_node(row: dict[str, str], config_text: str, fetched_at: float | None 
         "probed_at": 0,
     }
 
-def fetch_candidates() -> list[dict[str, Any]]:
+def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
+    scan_limit = MAX_SCAN_ROWS if max_scan_rows is None else max(1, int(max_scan_rows))
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
@@ -379,7 +380,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 api_text = fetch_api_text(url, verify_ssl)
                 rows = parse_vpngate_rows(api_text)
                 snapshot_fetched_at = time.time()
-                for row in rows[:MAX_SCAN_ROWS]:
+                for row in rows[:scan_limit]:
                     ip = row.get("IP", "")
                     if not ip or ip in seen_ips:
                         continue

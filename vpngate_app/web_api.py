@@ -13,6 +13,38 @@ from types import ModuleType
 from typing import Any
 
 APP: ModuleType
+ROUTINE_POLL_ENDPOINTS = ("/api/dashboard", "/api/gateway_status", "/api/traffic", "/api/logs")
+
+
+def is_routine_successful_poll(command: str, request_path: str, status: Any) -> bool:
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        return False
+    path = urllib.parse.urlsplit(request_path).path
+    return (
+        command == "GET"
+        and status_code < 400
+        and any(path.endswith(endpoint) for endpoint in ROUTINE_POLL_ENDPOINTS)
+    )
+
+
+def bounded_int_setting(
+    payload: dict[str, Any],
+    config: dict[str, Any],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+    label: str,
+) -> int:
+    try:
+        value = int(payload.get(key, config.get(key, default)))
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}必须是整数")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+    return value
 
 
 def create_handler(backend: ModuleType) -> type[BaseHTTPRequestHandler]:
@@ -73,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def log_message(self, format: str, *args: Any) -> None:
+        status = args[1] if len(args) > 1 else 0
+        if is_routine_successful_poll(self.command, self.path, status):
+            return
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
     def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -128,6 +163,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/settings":
             config = APP.load_ui_config()
             region_limit = int(config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT))
+            nodes = APP.read_nodes()
             self.send_json({
                 "ok": True,
                 "username": config.get("username", ""),
@@ -135,8 +171,11 @@ class Handler(BaseHTTPRequestHandler):
                 "proxy_username": config.get("proxy_username", ""),
                 "proxy_password": config.get("proxy_password", ""),
                 "region_node_limit": region_limit,
-                "node_cache_size": region_limit * len(APP.country_choice_payloads(APP.read_nodes())),
-                "node_cache_count": len(APP.read_nodes()),
+                "node_test_workers": APP.configured_node_test_workers(config),
+                "max_scan_rows": APP.configured_max_scan_rows(config),
+                "node_auto_retest_seconds_per_node": APP.configured_node_retest_seconds(config),
+                "node_cache_size": region_limit * len(APP.country_choice_payloads(nodes)),
+                "node_cache_count": len(nodes),
             })
         elif effective_path == "/api/nodes":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -239,6 +278,33 @@ class Handler(BaseHTTPRequestHandler):
                     ))
                 except (TypeError, ValueError):
                     raise ValueError("每地区节点上限必须是整数")
+                node_test_workers = bounded_int_setting(
+                    payload,
+                    config,
+                    "node_test_workers",
+                    APP.DEFAULT_NODE_TEST_WORKERS,
+                    APP.MIN_NODE_TEST_WORKERS,
+                    APP.MAX_NODE_TEST_WORKERS,
+                    "节点检测并发数",
+                )
+                max_scan_rows = bounded_int_setting(
+                    payload,
+                    config,
+                    "max_scan_rows",
+                    APP.DEFAULT_MAX_SCAN_ROWS,
+                    APP.MIN_SCAN_ROWS,
+                    APP.MAX_SCAN_ROWS_LIMIT,
+                    "API 最大候选数",
+                )
+                node_retest_seconds = bounded_int_setting(
+                    payload,
+                    config,
+                    "node_auto_retest_seconds_per_node",
+                    APP.DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+                    APP.MIN_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+                    APP.MAX_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+                    "每节点自动重测间隔",
+                )
                 if not username:
                     raise ValueError("管理用户名不能为空")
                 if password and password != password_confirm:
@@ -277,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
                 config["proxy_password"] = proxy_password
                 old_region_node_limit = int(config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT))
                 config["region_node_limit"] = region_node_limit
+                config["node_test_workers"] = node_test_workers
+                config["max_scan_rows"] = max_scan_rows
+                config["node_auto_retest_seconds_per_node"] = node_retest_seconds
                 APP.save_ui_config(config)
                 if region_node_limit != old_region_node_limit:
                     threading.Thread(
@@ -294,6 +363,9 @@ class Handler(BaseHTTPRequestHandler):
                     "reauth_required": reauth,
                     "secret_path": secret_path,
                     "region_node_limit": region_node_limit,
+                    "node_test_workers": node_test_workers,
+                    "max_scan_rows": max_scan_rows,
+                    "node_auto_retest_seconds_per_node": node_retest_seconds,
                 })
 
             elif effective_path == "/api/slots/update":
@@ -372,7 +444,12 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 else:
                     APP.schedule_cached_node_test()
-                    self.send_json({"ok": True, "running": True, "message": "已将缓存池节点加入队列，使用 8 线程测试"})
+                    worker_count = APP.configured_node_test_workers()
+                    self.send_json({
+                        "ok": True,
+                        "running": True,
+                        "message": f"已将缓存池节点加入队列，使用 {worker_count} 线程测试",
+                    })
 
             elif effective_path == "/api/nodes/test":
                 payload = self.read_json_body()

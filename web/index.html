@@ -131,6 +131,14 @@
           <div class="field-hint">各地区独立计算上限，避免日本、韩国等节点较多的地区占满整个节点池。</div>
           <div class="muted" id="node-cache-status" style="font-size:12px;margin-top:10px">当前占用 0；每地区最多 10</div>
         </div></div>
+        <div class="panel"><div class="panel-head"><h2>节点检测性能</h2></div><div class="panel-body">
+          <div class="field"><label>节点检测并发数</label><input class="input" type="number" min="1" max="8" step="1" id="node-test-workers" value="8"></div>
+          <div class="field-hint">下一批检测生效。数值越大检测越快，但 CPU 峰值越高。</div>
+          <div class="field" style="margin-top:14px"><label>API 最大候选数</label><input class="input" type="number" min="1" max="2000" step="1" id="max-scan-rows" value="300"></div>
+          <div class="field-hint">下一次更新节点生效。数值越小需要建立的临时隧道越少。</div>
+          <div class="field" style="margin-top:14px"><label>每节点自动重测间隔（秒）</label><input class="input" type="number" min="1" max="3600" step="1" id="node-auto-retest-seconds" value="10"></div>
+          <div class="field-hint">后台等待时间为“当前节点数 × 此值”，下一轮调度时生效。</div>
+        </div></div>
       </div>
     </section>
   </main>

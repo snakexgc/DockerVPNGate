@@ -17,7 +17,9 @@ import vpn_utils
 from .common import parse_int, safe_name
 from .config import (
     API_URL, CHECK_INTERVAL_SECONDS, CONFIG_DIR, FETCH_INTERVAL_SECONDS,
-    NODES_FILE, OPENVPN_TEST_TIMEOUT_SECONDS, PROXY_PORTS, STATE_FILE,
+    MAX_NODE_TEST_WORKERS, MIN_NODE_TEST_WORKERS,
+    NODES_FILE, NODE_TEST_PERSIST_BATCH_SIZE, NODE_TEST_PERSIST_INTERVAL_SECONDS,
+    NODE_TEST_WORKERS, OPENVPN_TEST_TIMEOUT_SECONDS, PROXY_PORTS, STATE_FILE,
 )
 from .openvpn_runtime import run_openvpn_until_ready, stop_process
 from .policy_routing import cleanup_policy_routing, setup_policy_routing
@@ -30,7 +32,6 @@ def configure_backend(backend: ModuleType) -> None:
     global APP
     APP = backend
 
-NODE_TEST_WORKERS = 8
 NODE_STATUS_QUEUED = "queued"
 NODE_STATUS_TESTING = "testing"
 NODE_STATUS_AVAILABLE = "available"
@@ -120,6 +121,8 @@ def country_matches(node_country: Any, target_country: Any) -> bool:
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
+batch_probe_status_lock = threading.Lock()
+batch_probe_status: dict[str, str] = {}
 single_node_test_lock = threading.Lock()
 single_node_test_generation = 0
 single_node_test_cancel_event: threading.Event | None = None
@@ -136,6 +139,21 @@ def get_free_test_index() -> int:
 def release_test_index(idx: int) -> None:
     with test_indexes_lock:
         active_test_indexes.discard(idx)
+
+
+def batch_probe_statuses() -> dict[str, str]:
+    with batch_probe_status_lock:
+        return dict(batch_probe_status)
+
+
+def set_batch_probe_status(node_id: str, status: str) -> None:
+    with batch_probe_status_lock:
+        batch_probe_status[node_id] = status
+
+
+def clear_batch_probe_statuses() -> None:
+    with batch_probe_status_lock:
+        batch_probe_status.clear()
 
 def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
@@ -473,7 +491,12 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     finally:
         finish_single_node_test(generation, cancel_event)
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str], worker_count: int | None = None) -> list[dict[str, Any]]:
+    try:
+        requested_workers = int(worker_count if worker_count is not None else NODE_TEST_WORKERS)
+    except (TypeError, ValueError):
+        requested_workers = NODE_TEST_WORKERS
+    worker_count = max(MIN_NODE_TEST_WORKERS, min(MAX_NODE_TEST_WORKERS, requested_workers))
     selected_ids = {str(node_id) for node_id in node_ids if node_id}
     with APP.lock:
         nodes = read_nodes()
@@ -481,7 +504,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         for n in nodes:
             if str(n.get("id") or "") in selected_ids:
                 n["probe_status"] = NODE_STATUS_QUEUED
-                n["probe_message"] = "已加入检测队列，等待 8 线程工作器处理"
+                n["probe_message"] = f"已加入检测队列，等待 {worker_count} 线程工作器处理"
         write_json(NODES_FILE, sort_all_nodes(nodes))
 
     pending: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -494,6 +517,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         APP.node_test_batch_active = True
         APP.node_test_cancel_event = cancel_event
         APP.node_test_pending_queue = pending
+    clear_batch_probe_statuses()
+    for node_id in selected_ids:
+        set_batch_probe_status(node_id, NODE_STATUS_QUEUED)
 
     def test_one(n_info: dict[str, Any]) -> dict[str, Any] | None:
         if cancel_event.is_set():
@@ -564,11 +590,55 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     updated_nodes_map: dict[str, dict[str, Any]] = {}
     result_lock = threading.Lock()
     progress_lock = threading.Lock()
+    persist_lock = threading.Lock()
     completed = 0
     total = len(to_test)
+    last_state_update_at = 0.0
+    last_persisted_count = 0
+    last_persisted_at = time.monotonic()
+
+    def persist_results(force: bool = False, reset_pending: bool = False) -> None:
+        """Persist completed probes in batches instead of rewriting nodes.json per node."""
+        nonlocal last_persisted_at, last_persisted_count
+        if not persist_lock.acquire(blocking=force):
+            return
+        try:
+            with result_lock:
+                results = dict(updated_nodes_map)
+            result_count = len(results)
+            now = time.monotonic()
+            if (
+                not force
+                and result_count - last_persisted_count < NODE_TEST_PERSIST_BATCH_SIZE
+                and now - last_persisted_at < NODE_TEST_PERSIST_INTERVAL_SECONDS
+            ):
+                return
+            if not force and result_count == last_persisted_count and not reset_pending:
+                return
+
+            with APP.lock:
+                current_nodes = read_nodes()
+                for node in current_nodes:
+                    node_id = str(node.get("id") or "")
+                    result = results.get(node_id)
+                    if result:
+                        node.update(result)
+                    elif (
+                        reset_pending
+                        and node_id in selected_ids
+                        and node.get("probe_status")
+                        in (NODE_STATUS_QUEUED, NODE_STATUS_TESTING, NODE_STATUS_NOT_CHECKED)
+                    ):
+                        node["probe_status"] = NODE_STATUS_QUEUED
+                        node["probe_message"] = "检测被更新节点操作取消，等待重新入队"
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            last_persisted_count = result_count
+            last_persisted_at = now
+        finally:
+            persist_lock.release()
 
     def worker() -> None:
-        nonlocal completed
+        nonlocal completed, last_state_update_at
         while not cancel_event.is_set():
             try:
                 node_info = pending.get_nowait()
@@ -576,16 +646,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 return
             node_id = str(node_info.get("id") or "")
             result: dict[str, Any] | None = None
+            set_batch_probe_status(node_id, NODE_STATUS_TESTING)
             try:
-                with APP.lock:
-                    current_nodes = read_nodes()
-                    for node in current_nodes:
-                        if str(node.get("id") or "") == node_id:
-                            node["probe_status"] = NODE_STATUS_TESTING
-                            node["probe_message"] = "正在检测节点连通性..."
-                            node["probe_started_at"] = time.time()
-                            break
-                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
                 result = test_one(node_info)
             except Exception as exc:
                 if not cancel_event.is_set():
@@ -603,25 +665,26 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 continue
             with result_lock:
                 updated_nodes_map[node_id] = result
-            with APP.lock:
-                current_nodes = read_nodes()
-                for node in current_nodes:
-                    if node.get("id") == node_id:
-                        node.update(result)
-                        break
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            set_batch_probe_status(node_id, str(result.get("probe_status") or NODE_STATUS_UNAVAILABLE))
+            progress_message = ""
             with progress_lock:
                 completed += 1
-                APP.set_state(
-                    last_check_message=(
-                        f"8 线程并发检测节点：已完成 {completed}/{total}，"
+                now = time.monotonic()
+                if completed == total or now - last_state_update_at >= 1.0:
+                    last_state_update_at = now
+                    progress_message = (
+                        f"{worker_count} 线程并发检测节点：已完成 {completed}/{total}，"
                         f"队列剩余 {pending.qsize()}"
                     )
+            if progress_message:
+                APP.set_state(
+                    last_check_message=progress_message
                 )
+            persist_results()
 
     threads = [
         threading.Thread(target=worker, name=f"node-test-{index + 1}", daemon=True)
-        for index in range(min(NODE_TEST_WORKERS, total))
+        for index in range(min(worker_count, total))
     ]
     try:
         APP.set_state(last_check_message=f"已将 {total} 个节点加入队列，使用 {len(threads)} 个线程并发检测")
@@ -641,26 +704,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     vpn_utils.enrich_ip_info(successful_nodes)
                 except Exception as exc:
                     print(f"[test_multiple_nodes] 批量富化 IP 失败: {exc}", flush=True)
-                with APP.lock:
-                    current_nodes = read_nodes()
-                    for node in current_nodes:
-                        result = updated_nodes_map.get(str(node.get("id") or ""))
-                        if result:
-                            node.update(result)
-                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            persist_results(force=True)
     finally:
         if cancel_event.is_set():
-            with APP.lock:
-                current_nodes = read_nodes()
-                for node in current_nodes:
-                    if (
-                        str(node.get("id") or "") in selected_ids
-                        and node.get("probe_status") in (NODE_STATUS_QUEUED, NODE_STATUS_TESTING, NODE_STATUS_NOT_CHECKED)
-                    ):
-                        node["probe_status"] = NODE_STATUS_QUEUED
-                        node["probe_message"] = "检测被更新节点操作取消，等待重新入队"
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            persist_results(force=True, reset_pending=True)
             APP.set_state(last_check_message="当前测试队列已取消并清空")
+        clear_batch_probe_statuses()
         with APP.node_test_state_lock:
             APP.node_test_batch_active = False
             APP.node_test_cancel_event = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -9,19 +10,41 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
-    DATA_DIR, DEFAULT_REGION_NODE_LIMIT, MAX_REGION_NODE_LIMIT, MIN_REGION_NODE_LIMIT,
-    NODES_FILE, PROXY_INTERFACES, PROXY_PORTS, UI_HOST, UI_PORT,
+    DATA_DIR, DEFAULT_MAX_SCAN_ROWS, DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+    DEFAULT_NODE_TEST_WORKERS, DEFAULT_REGION_NODE_LIMIT,
+    MAX_NODE_AUTO_RETEST_SECONDS_PER_NODE, MAX_NODE_TEST_WORKERS, MAX_REGION_NODE_LIMIT,
+    MAX_SCAN_ROWS_LIMIT, MIN_NODE_AUTO_RETEST_SECONDS_PER_NODE, MIN_NODE_TEST_WORKERS,
+    MIN_REGION_NODE_LIMIT, MIN_SCAN_ROWS, NODES_FILE, PROXY_INTERFACES, PROXY_PORTS,
+    UI_HOST, UI_PORT,
 )
 
 storage_lock = threading.RLock()
+_nodes_cache_signature: tuple[int, int] | None = None
+_nodes_cache: list[dict[str, Any]] | None = None
 
 
 def write_json(path: Path, data: Any) -> None:
+    global _nodes_cache, _nodes_cache_signature
     with storage_lock:
         path.parent.mkdir(exist_ok=True, parents=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if path == NODES_FILE:
+            # nodes.json embeds complete OpenVPN profiles and is rewritten during
+            # maintenance. Compact encoding materially reduces serialization,
+            # disk traffic, and the cost of every subsequent read.
+            payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        else:
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp.write_text(payload, encoding="utf-8")
         tmp.replace(path)
+        if path == NODES_FILE:
+            normalized = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+            _nodes_cache = copy.deepcopy(normalized)
+            try:
+                stat = path.stat()
+                _nodes_cache_signature = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                _nodes_cache_signature = None
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -93,6 +116,9 @@ def load_ui_config() -> dict[str, Any]:
             "proxy_username": os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME") or "",
             "proxy_password": os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD") or "",
             "region_node_limit": DEFAULT_REGION_NODE_LIMIT,
+            "node_test_workers": DEFAULT_NODE_TEST_WORKERS,
+            "max_scan_rows": DEFAULT_MAX_SCAN_ROWS,
+            "node_auto_retest_seconds_per_node": DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
             "proxy_slots": normalize_proxy_slots(None),
         }
         updated = False
@@ -133,6 +159,26 @@ def load_ui_config() -> dict[str, Any]:
             region_node_limit = DEFAULT_REGION_NODE_LIMIT
         if config.get("region_node_limit") != region_node_limit:
             config["region_node_limit"] = region_node_limit; updated = True
+        numeric_settings = (
+            ("node_test_workers", DEFAULT_NODE_TEST_WORKERS, MIN_NODE_TEST_WORKERS, MAX_NODE_TEST_WORKERS),
+            ("max_scan_rows", DEFAULT_MAX_SCAN_ROWS, MIN_SCAN_ROWS, MAX_SCAN_ROWS_LIMIT),
+            (
+                "node_auto_retest_seconds_per_node",
+                DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+                MIN_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+                MAX_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+            ),
+        )
+        for key, default, minimum, maximum in numeric_settings:
+            try:
+                value = int(config.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            if not minimum <= value <= maximum:
+                value = default
+            if key not in data or config.get(key) != value:
+                config[key] = value
+                updated = True
         for key in ("proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"):
             if key in config:
                 config.pop(key, None); updated = True
@@ -149,5 +195,22 @@ def save_ui_config(config: dict[str, Any]) -> None:
 
 
 def read_nodes() -> list[dict[str, Any]]:
-    raw = read_json(NODES_FILE, [])
-    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    global _nodes_cache, _nodes_cache_signature
+    with storage_lock:
+        try:
+            stat = NODES_FILE.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            _nodes_cache = []
+            _nodes_cache_signature = None
+            return []
+        if _nodes_cache is not None and signature == _nodes_cache_signature:
+            return copy.deepcopy(_nodes_cache)
+        try:
+            raw = json.loads(NODES_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = []
+        normalized = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+        _nodes_cache = copy.deepcopy(normalized)
+        _nodes_cache_signature = signature
+        return copy.deepcopy(normalized)

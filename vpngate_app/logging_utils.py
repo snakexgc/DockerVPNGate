@@ -4,12 +4,32 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import DATA_DIR
 
 _lock = threading.RLock()
 _last_cleanup_time = 0.0
+
+
+def iter_file_lines_reverse(path: Path, chunk_size: int = 64 * 1024) -> Iterator[str]:
+    """Yield UTF-8 lines newest-first without loading the complete log file."""
+    with open(path, "rb") as stream:
+        stream.seek(0, 2)
+        position = stream.tell()
+        pending = b""
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            stream.seek(position)
+            pending = stream.read(read_size) + pending
+            lines = pending.split(b"\n")
+            pending = lines[0]
+            for line in reversed(lines[1:]):
+                if line:
+                    yield line.rstrip(b"\r").decode("utf-8", errors="replace")
+        if pending:
+            yield pending.rstrip(b"\r").decode("utf-8", errors="replace")
 
 
 def cleanup_old_logs(logs_dir: Path) -> None:
@@ -67,24 +87,27 @@ def read_log_entries(limit: int = 500, level: str = "", search: str = "") -> lis
         paths = sorted(logs_dir.glob("*.json"), reverse=True)
         for path in paths:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                lines = iter_file_lines_reverse(path)
             except OSError:
                 continue
-            for line in reversed(lines):
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                if requested_level and str(entry.get("level") or "").upper() != requested_level:
-                    continue
-                haystack = " ".join(str(entry.get(key) or "") for key in ("module", "thread", "message")).casefold()
-                if needle and needle not in haystack:
-                    continue
-                matches.append(entry)
-                if len(matches) >= limit:
-                    return list(reversed(matches))
+            try:
+                for line in lines:
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if requested_level and str(entry.get("level") or "").upper() != requested_level:
+                        continue
+                    haystack = " ".join(str(entry.get(key) or "") for key in ("module", "thread", "message")).casefold()
+                    if needle and needle not in haystack:
+                        continue
+                    matches.append(entry)
+                    if len(matches) >= limit:
+                        return list(reversed(matches))
+            except OSError:
+                continue
         return list(reversed(matches))
     except OSError:
         return []

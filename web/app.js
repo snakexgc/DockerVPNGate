@@ -116,7 +116,7 @@ function initializeResizableTables() {
   });
 }
 function activeElementId() { return document.activeElement?.dataset?.selectId || document.activeElement?.id || ""; }
-function settingsInputIds() { return ["current-admin-password","admin-username","admin-password","admin-password-confirm","secret-path","proxy-username","proxy-password","region-node-limit"]; }
+function settingsInputIds() { return ["current-admin-password","admin-username","admin-password","admin-password-confirm","secret-path","proxy-username","proxy-password","region-node-limit","node-test-workers","max-scan-rows","node-auto-retest-seconds"]; }
 function isSettingsFormActive() { return settingsInputIds().includes(activeElementId()); }
 function isNodeFilterActive() { return ["node-search","node-status","all-node-search","all-node-country","all-node-type","all-node-status"].includes(activeElementId()); }
 function shouldDeferHeartbeatRender() {
@@ -378,7 +378,7 @@ async function resetTraffic() {
 }
 function showScreen(screen, slot=currentSlot) {
   currentScreen=screen; currentSlot=slot; document.querySelectorAll(".screen").forEach(el=>el.classList.remove("active")); $(`screen-${screen}`).classList.add("active");
-  const titles={system:["系统状态","代理出口的实时运行状态"],nodes:["节点配置","查看本次获取的全部 VPNGate 节点并手动刷新"],proxy:[`代理 ${slot} 节点配置`,"选择首选地区、线路类型或指定节点"],logs:["运行日志","查看节点池、隧道与代理的实时事件"],settings:["设置","管理登录信息与代理端口认证"]};
+  const titles={system:["系统状态","代理出口的实时运行状态"],nodes:["节点配置","查看本次获取的全部 VPNGate 节点并手动刷新"],proxy:[`代理 ${slot} 节点配置`,"选择首选地区、线路类型或指定节点"],logs:["运行日志","查看节点池、隧道与代理的实时事件"],settings:["设置","管理登录、节点池、代理认证与检测性能"]};
   $("page-title").textContent=titles[screen][0]; $("page-subtitle").textContent=titles[screen][1]; $("sidebar").classList.remove("open"); $("save-settings").classList.toggle("visible", screen==="settings"); $("reset-traffic").classList.toggle("visible", screen==="system"); renderNavigation();
   if(screen==="system")loadTraffic();
   if(screen==="logs")loadLogs().catch(e=>showToast(e.message,true));
@@ -427,6 +427,9 @@ function fillSettings(force=false) {
   $("secret-path").value=dashboard.secret_path||"";
   $("proxy-username").value=dashboard.proxy_username||"";
   $("region-node-limit").value=dashboard.region_node_limit||10;
+  $("node-test-workers").value=dashboard.node_test_workers??8;
+  $("max-scan-rows").value=dashboard.max_scan_rows??300;
+  $("node-auto-retest-seconds").value=dashboard.node_auto_retest_seconds_per_node??10;
   if(!force) {
     settingsSavedUsername=dashboard.username||settingsSavedUsername;
     settingsSavedSecretPath=dashboard.secret_path||settingsSavedSecretPath;
@@ -444,6 +447,9 @@ async function loadSettingsSecrets(force=false) {
     dashboard.node_cache_size=data.node_cache_size||0;
     dashboard.region_node_limit=data.region_node_limit||10;
     dashboard.node_cache_count=data.node_cache_count||0;
+    dashboard.node_test_workers=data.node_test_workers??8;
+    dashboard.max_scan_rows=data.max_scan_rows??300;
+    dashboard.node_auto_retest_seconds_per_node=data.node_auto_retest_seconds_per_node??10;
   }
   $("node-cache-status").textContent=`当前占用 ${data.node_cache_count||0}；每地区最多 ${data.region_node_limit||10}`;
   if(!force && (settingsDirty || isSettingsFormActive()))return;
@@ -455,6 +461,9 @@ async function loadSettingsSecrets(force=false) {
   $("proxy-username").value=data.proxy_username||"";
   $("proxy-password").value=data.proxy_password||"";
   $("region-node-limit").value=data.region_node_limit||10;
+  $("node-test-workers").value=data.node_test_workers??8;
+  $("max-scan-rows").value=data.max_scan_rows??300;
+  $("node-auto-retest-seconds").value=data.node_auto_retest_seconds_per_node??10;
   settingsDirty=false;
 }
 function toggleSecretInput(id) {
@@ -497,13 +506,16 @@ async function saveSettings() {
         secret_path:$("secret-path").value,
         proxy_username:$("proxy-username").value,
         proxy_password:$("proxy-password").value,
-        region_node_limit:Number($("region-node-limit").value)
+        region_node_limit:Number($("region-node-limit").value),
+        node_test_workers:Number($("node-test-workers").value),
+        max_scan_rows:Number($("max-scan-rows").value),
+        node_auto_retest_seconds_per_node:Number($("node-auto-retest-seconds").value)
       })
     });
     if(data.reauth_required){
       location.href=`/${data.secret_path}/`;
     }else{
-      showToast("设置已保存，缓存池与五端口认证配置已更新");
+      showToast("设置已保存；检测性能参数将在下一批任务或调度周期生效");
       settingsDirty=false;
       await loadDashboard(false,{forceForms:true});
       await loadSettingsSecrets(true);

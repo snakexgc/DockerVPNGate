@@ -86,6 +86,19 @@ COUNTRY_TRANSLATIONS = {
     "Macau": "澳门",
     "Iceland": "冰岛",
     "Luxembourg": "卢森堡",
+    "Northern Mariana Islands": "北马里亚纳群岛",
+    "MP": "北马里亚纳群岛",
+    "Belarus": "白俄罗斯",
+    "BY": "白俄罗斯",
+    "Ecuador": "厄瓜多尔",
+    "EC": "厄瓜多尔",
+    "Lao People's Democratic Republic": "老挝",
+    "Laos": "老挝",
+    "LA": "老挝",
+    "Lithuania": "立陶宛",
+    "LT": "立陶宛",
+    "Peru": "秘鲁",
+    "PE": "秘鲁",
 }
 
 def _safe_int(val: Any, default: int = 0) -> int:

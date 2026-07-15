@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import threading
 import time
 import subprocess
@@ -12,8 +14,11 @@ from http.server import HTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from vpngate_app.config import PROXY_INTERFACES, PROXY_PORTS
-from vpngate_app import node_testing
+from vpngate_app.config import (
+    DEFAULT_MAX_SCAN_ROWS, DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
+    DEFAULT_NODE_TEST_WORKERS, PROXY_INTERFACES, PROXY_PORTS,
+)
+from vpngate_app import logging_utils, node_testing, storage
 from vpngate_app import openvpn_runtime, policy_routing
 from vpngate_app.node_testing import (
     NODE_STATUS_AVAILABLE, NODE_STATUS_QUEUED, NODE_STATUS_TESTING,
@@ -21,7 +26,7 @@ from vpngate_app.node_testing import (
 )
 from vpngate_app.storage import normalize_proxy_slots
 from vpngate_app.traffic import TrafficMonitor
-from vpngate_app.web_api import create_handler
+from vpngate_app.web_api import bounded_int_setting, create_handler, is_routine_successful_poll
 import vpngate_manager
 
 
@@ -35,6 +40,30 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(slots), 5)
         self.assertEqual(slots[0]["routing_ip_type"], "all")
         self.assertEqual(slots[0]["switch_mode"], "auto")
+
+    def test_web_performance_defaults_match_runtime_defaults(self) -> None:
+        self.assertEqual(DEFAULT_NODE_TEST_WORKERS, 8)
+        self.assertEqual(DEFAULT_MAX_SCAN_ROWS, 300)
+        self.assertEqual(DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE, 10)
+
+    def test_web_performance_settings_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(storage, "DATA_DIR", Path(temp_dir)):
+            config = storage.load_ui_config()
+            self.assertEqual(config["node_test_workers"], 8)
+            self.assertEqual(config["max_scan_rows"], 300)
+            self.assertEqual(config["node_auto_retest_seconds_per_node"], 10)
+
+            config.update(
+                node_test_workers=2,
+                max_scan_rows=150,
+                node_auto_retest_seconds_per_node=30,
+            )
+            storage.save_ui_config(config)
+            reloaded = storage.load_ui_config()
+
+        self.assertEqual(reloaded["node_test_workers"], 2)
+        self.assertEqual(reloaded["max_scan_rows"], 150)
+        self.assertEqual(reloaded["node_auto_retest_seconds_per_node"], 30)
 
 
 class TrafficTests(unittest.TestCase):
@@ -89,6 +118,21 @@ class NodeStatusTests(unittest.TestCase):
 
 
 class DashboardPayloadTests(unittest.TestCase):
+    def test_requested_country_names_and_iso_codes_are_translated(self) -> None:
+        translations = {
+            "Northern Mariana Islands": ("MP", "北马里亚纳群岛"),
+            "Belarus": ("BY", "白俄罗斯"),
+            "Ecuador": ("EC", "厄瓜多尔"),
+            "Lao People's Democratic Republic": ("LA", "老挝"),
+            "Lithuania": ("LT", "立陶宛"),
+            "Peru": ("PE", "秘鲁"),
+        }
+
+        for english_name, (country_code, chinese_name) in translations.items():
+            with self.subTest(country=english_name):
+                self.assertEqual(vpngate_manager.normalized_country_name(english_name), chinese_name)
+                self.assertEqual(vpngate_manager.normalized_country_name(country_code), chinese_name)
+
     def test_country_choices_include_counts_and_merge_translated_aliases(self) -> None:
         canada = vpngate_manager.normalized_country_name("Canada")
         choices = vpngate_manager.country_choice_payloads([
@@ -253,8 +297,18 @@ class RegionNodePoolTests(unittest.TestCase):
             vpngate_manager.initial_node_pool_test_done = False
             with (
                 patch.object(vpngate_manager, "read_nodes", return_value=existing),
-                patch.object(vpngate_manager, "fetch_candidates", side_effect=RuntimeError("offline")),
-                patch.object(vpngate_manager, "load_ui_config", return_value={"region_node_limit": 2, "proxy_slots": [{} for _ in PROXY_PORTS]}),
+                patch.object(
+                    vpngate_manager,
+                    "fetch_candidates",
+                    side_effect=RuntimeError("offline"),
+                ) as fetch_nodes,
+                patch.object(vpngate_manager, "load_ui_config", return_value={
+                    "region_node_limit": 2,
+                    "node_test_workers": 2,
+                    "max_scan_rows": 150,
+                    "node_auto_retest_seconds_per_node": 30,
+                    "proxy_slots": [{} for _ in PROXY_PORTS],
+                }),
                 patch.object(vpngate_manager, "test_multiple_nodes") as test_nodes,
                 patch.object(vpngate_manager, "ensure_proxy_slot"),
                 patch.object(vpngate_manager, "pending_probe_count_from_nodes", return_value=0),
@@ -262,7 +316,8 @@ class RegionNodePoolTests(unittest.TestCase):
                 patch.object(vpngate_manager, "log_to_json"),
             ):
                 message = vpngate_manager.multi_maintain_nodes(force=True, wait=True)
-            test_nodes.assert_called_once_with(["old"])
+            test_nodes.assert_called_once_with(["old"], 2)
+            fetch_nodes.assert_called_once_with(150)
             self.assertIn("本地池已保留", message)
             self.assertTrue(vpngate_manager.initial_node_pool_test_done)
         finally:
@@ -386,6 +441,7 @@ class SchedulerTests(unittest.TestCase):
     def test_auto_retest_interval_scales_with_node_pool_size(self) -> None:
         self.assertEqual(vpngate_manager.node_pool_retest_interval_seconds(150), 1500)
         self.assertEqual(vpngate_manager.node_pool_retest_interval_seconds(0), 10)
+        self.assertEqual(vpngate_manager.node_pool_retest_interval_seconds(150, 30), 4500)
 
     def test_auto_proxy_waits_for_initial_node_pool_test(self) -> None:
         old_done = vpngate_manager.initial_node_pool_test_done
@@ -765,6 +821,138 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(latency, 0)
         self.assertEqual(timeout_attempts, 0)
         self.assertEqual(mocked_measure.call_count, 1)
+
+
+class PerformanceRegressionTests(unittest.TestCase):
+    def test_performance_setting_validation_rejects_out_of_range_values(self) -> None:
+        config = {"node_test_workers": 8}
+        self.assertEqual(
+            bounded_int_setting({"node_test_workers": 2}, config, "node_test_workers", 8, 1, 8, "并发数"),
+            2,
+        )
+        with self.assertRaisesRegex(ValueError, "必须在 1 到 8 之间"):
+            bounded_int_setting({"node_test_workers": 9}, config, "node_test_workers", 8, 1, 8, "并发数")
+
+    def test_successful_web_heartbeats_are_not_written_to_logs(self) -> None:
+        self.assertTrue(is_routine_successful_poll("GET", "/secret/api/dashboard", "200"))
+        self.assertTrue(is_routine_successful_poll("GET", "/secret/api/traffic?now=1", 200))
+        self.assertFalse(is_routine_successful_poll("GET", "/secret/api/dashboard", 500))
+        self.assertFalse(is_routine_successful_poll("POST", "/secret/api/dashboard", 200))
+
+    def test_nodes_file_is_parsed_once_until_it_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            nodes_path = Path(temp_dir) / "nodes.json"
+            nodes_path.write_text(json.dumps([{"id": "node-1", "config_text": "profile"}]), encoding="utf-8")
+            with (
+                patch.object(storage, "NODES_FILE", nodes_path),
+                patch.object(storage, "_nodes_cache", None),
+                patch.object(storage, "_nodes_cache_signature", None),
+                patch.object(storage.json, "loads", wraps=json.loads) as mocked_loads,
+            ):
+                first = storage.read_nodes()
+                first[0]["id"] = "mutated-copy"
+                second = storage.read_nodes()
+
+        self.assertEqual(mocked_loads.call_count, 1)
+        self.assertEqual(second[0]["id"], "node-1")
+
+    def test_recent_logs_are_read_from_the_tail_without_path_read_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            logs_dir = data_dir / "logs"
+            logs_dir.mkdir()
+            log_path = logs_dir / "2026-07-15.json"
+            entries = [
+                {"epoch": index, "level": "INFO", "module": "Test", "thread": "main", "message": f"line-{index}"}
+                for index in range(1000)
+            ]
+            log_path.write_text(
+                "\n".join(json.dumps(entry) for entry in entries) + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(logging_utils, "DATA_DIR", data_dir),
+                patch.object(Path, "read_text", side_effect=AssertionError("full-file read is not allowed")),
+            ):
+                recent = logging_utils.read_log_entries(limit=3)
+
+        self.assertEqual([entry["message"] for entry in recent], ["line-997", "line-998", "line-999"])
+
+    def test_proxy_monitor_reuses_one_nodes_snapshot_per_iteration(self) -> None:
+        nodes = [{"id": "cached-node"}]
+        config = {"proxy_slots": [{} for _ in PROXY_PORTS]}
+        with (
+            patch.object(vpngate_manager, "read_nodes", return_value=nodes) as mocked_read_nodes,
+            patch.object(vpngate_manager, "load_ui_config", return_value=config) as mocked_load_config,
+            patch.object(vpngate_manager, "slot_process_running", return_value=False),
+            patch.object(vpngate_manager, "ensure_proxy_slot") as mocked_ensure,
+            patch.object(vpngate_manager.time, "sleep", side_effect=SystemExit),
+        ):
+            with self.assertRaises(SystemExit):
+                vpngate_manager.multi_proxy_monitor()
+
+        self.assertEqual(mocked_read_nodes.call_count, 1)
+        self.assertEqual(mocked_load_config.call_count, 1)
+        self.assertEqual(mocked_ensure.call_count, len(PROXY_PORTS))
+        for call in mocked_ensure.call_args_list:
+            self.assertIs(call.args[1], nodes)
+            self.assertIs(call.args[2], config)
+
+    def test_batch_node_testing_does_not_rewrite_pool_for_every_node(self) -> None:
+        nodes = [
+            {"id": f"node-{index}", "config_text": "client\n", "probe_status": NODE_STATUS_QUEUED}
+            for index in range(20)
+        ]
+        current_nodes = copy.deepcopy(nodes)
+        writes: list[list[dict[str, object]]] = []
+        observed_live_statuses: list[set[str]] = []
+        old_app = node_testing.APP
+        fake_app = SimpleNamespace(
+            lock=threading.RLock(),
+            node_test_state_lock=threading.Lock(),
+            node_test_batch_active=False,
+            node_test_cancel_event=None,
+            node_test_pending_queue=None,
+            set_state=lambda **_updates: None,
+        )
+
+        def fake_read_nodes() -> list[dict[str, object]]:
+            return copy.deepcopy(current_nodes)
+
+        def fake_write_json(_path: Path, data: list[dict[str, object]]) -> None:
+            current_nodes[:] = copy.deepcopy(data)
+            writes.append(copy.deepcopy(data))
+
+        def fake_validate(*_args, **_kwargs) -> tuple[bool, int, str]:
+            observed_live_statuses.append(set(node_testing.batch_probe_statuses().values()))
+            return True, 25, "ok"
+
+        try:
+            node_testing.configure_backend(fake_app)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                with (
+                    patch.object(node_testing, "read_nodes", side_effect=fake_read_nodes),
+                    patch.object(node_testing, "write_json", side_effect=fake_write_json),
+                    patch.object(
+                        node_testing,
+                        "test_config_path",
+                        side_effect=lambda node_id: Path(temp_dir) / f"{node_id}.ovpn",
+                    ),
+                    patch.object(node_testing, "validate_node_tunnel_latency", side_effect=fake_validate),
+                    patch.object(node_testing.vpn_utils, "enrich_ip_info"),
+                    patch.object(node_testing, "NODE_TEST_WORKERS", 4),
+                    patch.object(node_testing, "NODE_TEST_PERSIST_BATCH_SIZE", 100),
+                    patch.object(node_testing, "NODE_TEST_PERSIST_INTERVAL_SECONDS", 60),
+                ):
+                    results = node_testing.test_multiple_nodes([node["id"] for node in nodes])
+        finally:
+            node_testing.configure_backend(old_app)
+            node_testing.clear_batch_probe_statuses()
+
+        self.assertEqual(len(results), len(nodes))
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(any(NODE_STATUS_TESTING in statuses for statuses in observed_live_statuses))
+        self.assertTrue(all(node["probe_status"] == NODE_STATUS_AVAILABLE for node in current_nodes))
 
 
 if __name__ == "__main__":
