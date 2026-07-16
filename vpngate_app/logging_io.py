@@ -8,21 +8,40 @@ from typing import Any
 
 class Tee:
     def __init__(self, file_path: str, max_bytes: int = 10 * 1024 * 1024):
-        path = Path(file_path)
-        path.parent.mkdir(exist_ok=True, parents=True)
+        self.path = Path(file_path)
+        self.max_bytes = max(1024, int(max_bytes))
+        self.path.parent.mkdir(exist_ok=True, parents=True)
         try:
-            if path.exists() and path.stat().st_size >= max_bytes:
-                backup = path.with_suffix(path.suffix + ".1")
+            if self.path.exists() and self.path.stat().st_size >= self.max_bytes:
+                backup = self.path.with_suffix(self.path.suffix + ".1")
                 if backup.exists():
                     backup.unlink()
-                path.replace(backup)
+                self.path.replace(backup)
         except OSError:
             pass
-        self.file = open(path, "a", encoding="utf-8")
+        self.file = open(self.path, "a", encoding="utf-8")
         self.stdout = sys.stdout
         self._lock = threading.RLock()
         self._buffer = ""
         self._emitting = threading.local()
+
+    def _rotate_for_write(self, data: str) -> None:
+        try:
+            current_size = self.path.stat().st_size if self.path.exists() else 0
+            incoming_size = len(data.encode("utf-8"))
+            if current_size + incoming_size < self.max_bytes:
+                return
+            self.file.flush()
+            self.file.close()
+            backup = self.path.with_suffix(self.path.suffix + ".1")
+            if backup.exists():
+                backup.unlink()
+            if self.path.exists():
+                self.path.replace(backup)
+            self.file = open(self.path, "a", encoding="utf-8")
+        except OSError:
+            if self.file.closed:
+                self.file = open(self.path, "a", encoding="utf-8")
 
     @staticmethod
     def _classify(line: str) -> tuple[str, str]:
@@ -49,6 +68,7 @@ class Tee:
     def write(self, data: str) -> None:
         with self._lock:
             self.stdout.write(data)
+            self._rotate_for_write(data)
             self.file.write(data)
             self.file.flush()
             self._buffer += data
@@ -57,8 +77,9 @@ class Tee:
                 self._emit_structured(line.rstrip("\r"))
 
     def flush(self) -> None:
-        self.stdout.flush()
-        self.file.flush()
+        with self._lock:
+            self.stdout.flush()
+            self.file.flush()
 
     def isatty(self) -> bool:
         return self.stdout.isatty()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import base64
+import io
 import json
+import socket
 import threading
 import time
 import subprocess
@@ -18,8 +21,10 @@ from vpngate_app.config import (
     DEFAULT_MAX_SCAN_ROWS, DEFAULT_NODE_AUTO_RETEST_SECONDS_PER_NODE,
     DEFAULT_NODE_TEST_WORKERS, PROXY_INTERFACES, PROXY_PORTS,
 )
-from vpngate_app import logging_utils, node_testing, storage
+from vpngate_app import logging_utils, node_testing, storage, vpngate_source
 from vpngate_app import openvpn_runtime, policy_routing
+from vpngate_app.logging_io import Tee
+from vpngate_app.openvpn_config import UnsafeOpenVPNConfig, validate_openvpn_config
 from vpngate_app.node_testing import (
     NODE_STATUS_AVAILABLE, NODE_STATUS_QUEUED, NODE_STATUS_TESTING,
     NODE_STATUS_UNAVAILABLE, sort_all_nodes,
@@ -28,6 +33,7 @@ from vpngate_app.storage import normalize_proxy_slots
 from vpngate_app.traffic import TrafficMonitor
 from vpngate_app.web_api import bounded_int_setting, create_handler, is_routine_successful_poll
 import vpngate_manager
+import proxy_server
 
 
 class ConfigTests(unittest.TestCase):
@@ -52,6 +58,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config["node_test_workers"], 8)
             self.assertEqual(config["max_scan_rows"], 300)
             self.assertEqual(config["node_auto_retest_seconds_per_node"], 10)
+            self.assertNotIn("api_url", config)
+            self.assertNotIn("api_ssl_verify", config)
 
             config.update(
                 node_test_workers=2,
@@ -86,6 +94,37 @@ class TrafficTests(unittest.TestCase):
 
 
 class NodeStatusTests(unittest.TestCase):
+    def test_latency_target_resolution_uses_the_same_doh_priority(self) -> None:
+        old_cache = dict(node_testing.latency_dns_cache)
+
+        def doh_result(_host, _qtype, endpoint, _bootstrap_ip, _timeout, interface):
+            self.assertIsNone(interface)
+            if endpoint == "https://dns.alidns.com/dns-query":
+                return "203.0.113.40"
+            return None
+
+        try:
+            node_testing.latency_dns_cache.update(ips=[], expires_at=0.0)
+            with patch.object(
+                proxy_server,
+                "doh_query_over_interface",
+                side_effect=doh_result,
+            ) as mocked_doh:
+                resolved = node_testing.resolve_latency_test_ips()
+
+            self.assertEqual(resolved, ["203.0.113.40"])
+            self.assertEqual(
+                [item.args[2] for item in mocked_doh.call_args_list],
+                [
+                    "https://dns.cloudflare.com/dns-query",
+                    "https://dns.google/dns-query",
+                    "https://dns.alidns.com/dns-query",
+                ],
+            )
+        finally:
+            node_testing.latency_dns_cache.clear()
+            node_testing.latency_dns_cache.update(old_cache)
+
     def test_queued_nodes_are_kept_in_pending_group(self) -> None:
         nodes = [
             {"id": "slow", "probe_status": "unavailable", "score": 999, "probed_at": 10},
@@ -126,6 +165,7 @@ class DashboardPayloadTests(unittest.TestCase):
             "Lao People's Democratic Republic": ("LA", "老挝"),
             "Lithuania": ("LT", "立陶宛"),
             "Peru": ("PE", "秘鲁"),
+            "Myanmar": ("MM", "缅甸"),
         }
 
         for english_name, (country_code, chinese_name) in translations.items():
@@ -355,6 +395,7 @@ class NetworkIsolationTests(unittest.TestCase):
 
         self.assertIn("--route-nopull", command)
         self.assertIn("--route-noexec", command)
+        self.assertEqual(command[command.index("--script-security") + 1], "1")
 
     def test_unisolated_openvpn_command_does_not_force_route_noexec(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -387,6 +428,379 @@ class NetworkIsolationTests(unittest.TestCase):
             commands,
         )
         self.assertIn(["ip", "rule", "del", "priority", "21010"], commands)
+
+
+class RemoteProfileSecurityTests(unittest.TestCase):
+    VALID_PROFILE = (
+        "client\n"
+        "dev tun\n"
+        "proto udp\n"
+        "remote 192.0.2.10 1194\n"
+        "cipher AES-128-CBC\n"
+        "auth SHA1\n"
+        "resolv-retry infinite\n"
+        "nobind\n"
+        "persist-key\n"
+        "persist-tun\n"
+        "remote-cert-tls server\n"
+        "<ca>\ncertificate-data\n</ca>\n"
+    )
+
+    def test_downloaded_profile_allowlist_accepts_connection_and_tls_material(self) -> None:
+        validate_openvpn_config(self.VALID_PROFILE)
+        encoded = base64.b64encode(self.VALID_PROFILE.encode("utf-8")).decode("ascii")
+        self.assertEqual(vpngate_source.decode_config(encoded), self.VALID_PROFILE)
+
+    def test_downloaded_profile_rejects_scripts_plugins_and_included_files(self) -> None:
+        for directive in ("script-security 2", "up /tmp/payload", "plugin payload.so", "config nested.conf"):
+            with self.subTest(directive=directive):
+                with self.assertRaises(UnsafeOpenVPNConfig):
+                    validate_openvpn_config(self.VALID_PROFILE + directive + "\n")
+
+    def test_runtime_revalidates_profile_before_starting_openvpn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "unsafe.ovpn"
+            config_path.write_text(
+                "client\nremote 192.0.2.10 1194\nscript-security 2\nup /tmp/payload\n",
+                encoding="utf-8",
+            )
+            with patch.object(openvpn_runtime.subprocess, "Popen") as mocked_popen:
+                ok, message, process = openvpn_runtime.run_openvpn_until_ready(
+                    str(config_path), keep_alive=False, route_nopull=True,
+                )
+
+        self.assertFalse(ok)
+        self.assertIsNone(process)
+        self.assertIn("ERR_OVPN_UNSAFE_CONFIG", message)
+        mocked_popen.assert_not_called()
+
+    def test_api_fetch_uses_fixed_https_without_custom_ssl_options(self) -> None:
+        calls: list[str] = []
+        api_url = vpngate_source.API_URL
+
+        def fail_fetch(url: str) -> str:
+            calls.append(url)
+            raise RuntimeError("offline")
+
+        with (
+            patch.object(vpngate_source, "cached_nodes", return_value=[]),
+            patch.object(vpngate_source, "load_blacklist", return_value={}),
+            patch.object(vpngate_source, "fetch_api_text", side_effect=fail_fetch),
+            patch.object(vpngate_source.time, "sleep"),
+            patch.object(vpngate_source.vpn_utils, "diagnose_api_failure", return_value=(1001, "offline")),
+            patch.object(vpngate_source, "_set_state"),
+            patch.object(vpngate_source, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                vpngate_source.fetch_candidates()
+
+        self.assertEqual(api_url, "https://www.vpngate.net/api/iphone/")
+        self.assertEqual(calls, [api_url] * 2)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                pass
+
+            def read(self) -> bytes:
+                return b"api-response"
+
+        with (
+            patch.object(vpngate_source.vpn_utils, "get_upstream_proxy", return_value=(None, None, None)),
+            patch.object(vpngate_source.urllib.request, "urlopen", return_value=FakeResponse()) as mocked_urlopen,
+        ):
+            self.assertEqual(
+                vpngate_source.fetch_api_text(api_url),
+                "api-response",
+            )
+
+        self.assertNotIn("context", mocked_urlopen.call_args.kwargs)
+        with self.assertRaisesRegex(ValueError, "HTTP 或 HTTPS URL"):
+            vpngate_source.fetch_api_text("ftp://reverse-proxy.example.test/vpngate")
+
+
+class ProxySafetyTests(unittest.TestCase):
+    def test_dns_resolution_uses_foreign_doh_before_domestic_doh(self) -> None:
+        host = "foreign-first.example.test"
+
+        def doh_result(_host, qtype, endpoint, _bootstrap_ip, _timeout, _interface):
+            if endpoint == "https://dns.alidns.com/dns-query" and qtype == 1:
+                return "203.0.113.10"
+            return None
+
+        with (
+            patch.object(proxy_server, "doh_query_over_interface", side_effect=doh_result) as mocked_doh,
+            patch.object(proxy_server, "dns_query_over_interface") as mocked_plain_dns,
+        ):
+            resolved = proxy_server.resolve_dns_over_interface(host, "tun0")
+
+        self.assertEqual(resolved, "203.0.113.10")
+        self.assertEqual(
+            [(item.args[2], item.args[1]) for item in mocked_doh.call_args_list],
+            [
+                ("https://dns.cloudflare.com/dns-query", 1),
+                ("https://dns.cloudflare.com/dns-query", 28),
+                ("https://dns.google/dns-query", 1),
+                ("https://dns.google/dns-query", 28),
+                ("https://dns.alidns.com/dns-query", 1),
+            ],
+        )
+        mocked_plain_dns.assert_not_called()
+
+    def test_dns_resolution_falls_back_to_plain_dns_after_all_doh(self) -> None:
+        host = "plain-fallback.example.test"
+
+        def plain_dns_result(_host, qtype, dns_server, _timeout, _interface):
+            if dns_server == "223.5.5.5" and qtype == 1:
+                return "203.0.113.20"
+            return None
+
+        with (
+            patch.object(proxy_server, "doh_query_over_interface", return_value=None) as mocked_doh,
+            patch.object(proxy_server, "dns_query_over_interface", side_effect=plain_dns_result) as mocked_plain_dns,
+        ):
+            resolved = proxy_server.resolve_dns_over_interface(host, "tun1")
+
+        self.assertEqual(resolved, "203.0.113.20")
+        self.assertEqual(len(mocked_doh.call_args_list), 6)
+        self.assertEqual(
+            [(item.args[2], item.args[1]) for item in mocked_plain_dns.call_args_list],
+            [
+                ("1.1.1.1", 1),
+                ("1.1.1.1", 28),
+                ("8.8.8.8", 1),
+                ("8.8.8.8", 28),
+                ("223.5.5.5", 1),
+            ],
+        )
+
+    def test_dns_cache_is_isolated_by_tunnel_interface(self) -> None:
+        host = "cache.example.test"
+        with (
+            patch.object(proxy_server, "doh_query_over_interface", return_value="203.0.113.30") as mocked_doh,
+            patch.object(proxy_server, "dns_query_over_interface") as mocked_plain_dns,
+        ):
+            first = proxy_server.resolve_dns_over_interface(host, "tun2")
+            cached = proxy_server.resolve_dns_over_interface(host, "tun2")
+            other_tunnel = proxy_server.resolve_dns_over_interface(host, "tun3")
+
+        self.assertEqual((first, cached, other_tunnel), ("203.0.113.30",) * 3)
+        self.assertEqual(mocked_doh.call_count, 2)
+        mocked_plain_dns.assert_not_called()
+
+    def test_dns_failure_does_not_fall_back_to_physical_system_resolver(self) -> None:
+        with (
+            patch.object(proxy_server, "resolve_dns_over_interface", return_value=None),
+            patch.object(proxy_server.socket, "getaddrinfo") as mocked_getaddrinfo,
+            patch.object(proxy_server.socket, "socket") as mocked_socket,
+        ):
+            with self.assertRaisesRegex(OSError, "ERR_TUN_DNS_FAILED"):
+                proxy_server.create_connection(("example.com", 443), "tun0")
+
+        mocked_getaddrinfo.assert_not_called()
+        mocked_socket.assert_not_called()
+
+    def test_accept_threads_keep_their_own_client_and_address(self) -> None:
+        class FakeClient:
+            def __init__(self, name: str):
+                self.name = name
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        clients = [FakeClient("first"), FakeClient("second")]
+
+        class FakeServer:
+            def __init__(self):
+                self.accept_index = 0
+
+            def setsockopt(self, *_args) -> None:
+                pass
+
+            def bind(self, *_args) -> None:
+                pass
+
+            def listen(self, *_args) -> None:
+                pass
+
+            def accept(self):
+                if self.accept_index >= len(clients):
+                    raise KeyboardInterrupt
+                index = self.accept_index
+                self.accept_index += 1
+                return clients[index], (f"192.0.2.{index + 1}", 10000 + index)
+
+        targets: list[object] = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+                targets.append(target)
+
+            def start(self) -> None:
+                pass
+
+        with (
+            patch.object(proxy_server.socket, "socket", return_value=FakeServer()),
+            patch.object(proxy_server.threading, "Thread", DeferredThread),
+            patch.object(proxy_server, "proxy_connection_sem", threading.BoundedSemaphore(2)),
+            patch.object(proxy_server, "proxy_client") as mocked_proxy_client,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                proxy_server.start_proxy_server("127.0.0.1", 7928, "tun0")
+            for target in targets:
+                target()
+
+        self.assertEqual(mocked_proxy_client.call_count, 2)
+        self.assertIs(mocked_proxy_client.call_args_list[0].args[0], clients[0])
+        self.assertEqual(mocked_proxy_client.call_args_list[0].args[1], ("192.0.2.1", 10000))
+        self.assertIs(mocked_proxy_client.call_args_list[1].args[0], clients[1])
+        self.assertEqual(mocked_proxy_client.call_args_list[1].args[1], ("192.0.2.2", 10001))
+
+
+class ConcurrentStateTests(unittest.TestCase):
+    def test_ui_config_transactions_preserve_independent_concurrent_updates(self) -> None:
+        errors: list[BaseException] = []
+        start = threading.Barrier(2)
+
+        def worker(mutator) -> None:
+            try:
+                start.wait(timeout=2)
+                storage.update_ui_config(mutator)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def update_first(config: dict[str, object]) -> None:
+            time.sleep(0.03)
+            config["proxy_slots"][0]["preferred_country"] = "Japan"  # type: ignore[index]
+
+        def update_second(config: dict[str, object]) -> None:
+            config["proxy_slots"][1]["enabled"] = False  # type: ignore[index]
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(storage, "DATA_DIR", Path(temp_dir)):
+            threads = [
+                threading.Thread(target=worker, args=(update_first,)),
+                threading.Thread(target=worker, args=(update_second,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            config = storage.load_ui_config()
+
+        self.assertFalse(errors)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(config["proxy_slots"][0]["preferred_country"], "Japan")
+        self.assertFalse(config["proxy_slots"][1]["enabled"])
+
+    def test_node_mutations_reread_latest_snapshot_before_each_write(self) -> None:
+        current = [
+            {"id": "first", "probe_status": NODE_STATUS_QUEUED, "latency_ms": 0},
+            {"id": "second", "probe_status": NODE_STATUS_QUEUED, "latency_ms": 0},
+        ]
+
+        def fake_read_nodes() -> list[dict[str, object]]:
+            return copy.deepcopy(current)
+
+        def fake_write_json(_path: Path, data: list[dict[str, object]]) -> None:
+            current[:] = copy.deepcopy(data)
+
+        def update_first(node: dict[str, object]) -> None:
+            time.sleep(0.03)
+            node["latency_ms"] = 25
+
+        def update_second(node: dict[str, object]) -> None:
+            node["probe_status"] = NODE_STATUS_AVAILABLE
+
+        with (
+            patch.object(vpngate_manager, "read_nodes", side_effect=fake_read_nodes),
+            patch.object(vpngate_manager, "write_json", side_effect=fake_write_json),
+        ):
+            threads = [
+                threading.Thread(target=vpngate_manager.mutate_cached_node, args=("first", update_first)),
+                threading.Thread(target=vpngate_manager.mutate_cached_node, args=("second", update_second)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        by_id = {node["id"]: node for node in current}
+        self.assertEqual(by_id["first"]["latency_ms"], 25)
+        self.assertEqual(by_id["second"]["probe_status"], NODE_STATUS_AVAILABLE)
+
+    def test_stale_health_result_is_not_applied_to_replacement_tunnel(self) -> None:
+        old_runtime = dict(vpngate_manager.proxy_slots_runtime[0])
+        runtime = vpngate_manager.proxy_slots_runtime[0]
+        old_process = object()
+        replacement_process = object()
+        try:
+            runtime.update(
+                process=old_process,
+                active_node_id="old-node",
+                connection_generation=10,
+                proxy_latency_ms=11,
+                connecting=False,
+                last_google204_check=0,
+            )
+
+            def replace_during_check(_index: int):
+                runtime.update(
+                    process=replacement_process,
+                    active_node_id="replacement-node",
+                    connection_generation=11,
+                )
+                return True, 999, "ok", 0
+
+            with (
+                patch.object(vpngate_manager, "slot_process_running", return_value=True),
+                patch.object(vpngate_manager, "measure_active_proxy_google204", side_effect=replace_during_check),
+            ):
+                vpngate_manager.run_active_proxy_google204_check(
+                    0, [{"id": "old-node", "country": "Japan"}], now=100,
+                )
+
+            self.assertIs(runtime["process"], replacement_process)
+            self.assertEqual(runtime["active_node_id"], "replacement-node")
+            self.assertEqual(runtime["proxy_latency_ms"], 11)
+        finally:
+            runtime.clear()
+            runtime.update(old_runtime)
+
+
+class LoggingAndLoginRegressionTests(unittest.TestCase):
+    def test_console_log_rotates_while_process_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "manager.log"
+            tee = Tee(str(log_path), max_bytes=1024)
+            tee.stdout = io.StringIO()
+            try:
+                tee.write("a" * 900)
+                tee.write("b" * 200)
+            finally:
+                tee.file.close()
+
+            backup = log_path.with_suffix(".log.1")
+            self.assertEqual(backup.read_text(encoding="utf-8"), "a" * 900)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "b" * 200)
+
+    def test_login_preserves_leading_and_trailing_password_whitespace(self) -> None:
+        login_html = (Path(__file__).resolve().parents[1] / "web" / "login.html").read_text(encoding="utf-8")
+        password_expression = 'document.getElementById("password").value'
+        self.assertIn(f"const pwd = {password_expression};", login_html)
+        self.assertNotIn(f"{password_expression}.trim()", login_html)
+
+    def test_settings_panel_has_no_api_tls_controls(self) -> None:
+        web_dir = Path(__file__).resolve().parents[1] / "web"
+        index_html = (web_dir / "index.html").read_text(encoding="utf-8")
+        app_js = (web_dir / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn('id="api-url"', index_html)
+        self.assertNotIn('api-ssl-verify', index_html)
+        self.assertNotIn('api_url:', app_js)
+        self.assertNotIn('api_ssl_verify', app_js)
 
 
 class WebRoutingTests(unittest.TestCase):

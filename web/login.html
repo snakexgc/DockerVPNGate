@@ -217,7 +217,7 @@
     async function handleLogin(e) {
       e.preventDefault();
       const uname = document.getElementById("username").value.trim();
-      const pwd = document.getElementById("password").value.trim();
+      const pwd = document.getElementById("password").value;
       const errorText = document.getElementById("error_text");
       const submitBtn = document.getElementById("submit_btn");
       

@@ -20,6 +20,10 @@ services:
       VPNGATE_DATA_DIR: /var/lib/dockervpngate
       UI_HOST: 0.0.0.0
       LOCAL_PROXY_HOST: 0.0.0.0
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 223.5.5.5
     ports:
       - "8787:8787/tcp"
       - "127.0.0.1:7928:7928/tcp"

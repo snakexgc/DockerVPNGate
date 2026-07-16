@@ -19,6 +19,7 @@ from .config import (
     OPENVPN_CMD, OPENVPN_TEST_TIMEOUT_SECONDS, ROOT_DIR, UPSTREAM_PROXY_AUTH_FILE,
 )
 from .logging_utils import log_to_json
+from .openvpn_config import UnsafeOpenVPNConfig, validate_openvpn_config
 
 _state_writer: Callable[..., None] | None = None
 
@@ -117,6 +118,10 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         command.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
 
     command.extend(["--verb", "3"])
+    # Level 1 allows OpenVPN's built-in ip/route helpers but forbids downloaded
+    # profiles from invoking user-defined programs. The profile is allowlisted
+    # again immediately before process creation.
+    command.extend(["--script-security", "1"])
 
     if os.path.exists("/etc/ssl/certs"):
         command.extend(["--capath", "/etc/ssl/certs"])
@@ -256,6 +261,10 @@ def run_openvpn_until_ready(
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     emit_live_logs = keep_alive if log_live is None else log_live
     try:
+        validate_openvpn_config(Path(config_file).read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeError, UnsafeOpenVPNConfig) as exc:
+        return False, f"[错误代码 2008] [ERR_OVPN_UNSAFE_CONFIG] 已拒绝不安全的 OpenVPN 配置: {exc}", None
+    try:
         process = subprocess.Popen(
             openvpn_command(config_file, route_nopull, dev),
             stdout=subprocess.PIPE,
@@ -286,13 +295,6 @@ def run_openvpn_until_ready(
             else:
                 if emit_live_logs:
                     print(f"[OpenVPN] {line_str}", flush=True)
-                    level = "INFO"
-                    line_lower = line_str.lower()
-                    if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
-                        level = "ERROR"
-                    elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
-                        level = "WARNING"
-                    log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
         if not startup_done[0]:
             lines.put(None)
 
@@ -334,15 +336,17 @@ def run_openvpn_until_ready(
     else:
         message = f"OpenVPN timeout after {limit}s."
 
-    # Bulk write accumulated startup logs
-    for line_str in openvpn_logs:
-        level = "INFO"
-        line_lower = line_str.lower()
-        if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
-            level = "ERROR"
-        elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
-            level = "WARNING"
-        log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
+    # Live OpenVPN output is already mirrored into structured logs by Tee.
+    # Quiet batch probes still need one explicit bulk write per startup line.
+    if not emit_live_logs:
+        for line_str in openvpn_logs:
+            level = "INFO"
+            line_lower = line_str.lower()
+            if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+                level = "ERROR"
+            elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
+                level = "WARNING"
+            log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     cancelled = cancel_event is not None and cancel_event.is_set()
     if not ok and not cancelled:

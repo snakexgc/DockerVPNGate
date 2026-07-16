@@ -4,7 +4,6 @@ import base64
 import csv
 import select
 import socket
-import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -15,6 +14,7 @@ import vpn_utils
 from .common import parse_int, safe_name
 from .config import API_URL, BLACKLIST_FILE, CONFIG_DIR, MAX_SCAN_ROWS
 from .logging_utils import log_to_json
+from .openvpn_config import validate_openvpn_config
 from .storage import read_json, read_nodes, write_json
 
 _state_writer: Callable[..., None] | None = None
@@ -41,19 +41,6 @@ def recv_exact_from_socket(sock: socket.socket, size: int) -> bytes:
         if not chunk:
             raise RuntimeError("Unexpected EOF while reading proxy response")
         data += chunk
-    return data
-
-def read_http_response_head(sock: socket.socket, limit: int = 65536) -> bytes:
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-        if len(data) > limit:
-            raise RuntimeError("Proxy response header too large")
-    if b"\r\n\r\n" not in data:
-        raise RuntimeError("Incomplete HTTP proxy response header")
     return data
 
 def socks5_address_bytes(host: str) -> tuple[int, bytes]:
@@ -88,18 +75,15 @@ def read_socks5_connect_reply(sock: socket.socket) -> None:
     if header[1] != 0:
         raise RuntimeError(f"SOCKS5 connection request rejected, code={header[1]}")
 
-def format_host_port(host: str, port: int) -> str:
-    return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
-
-def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
+def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int) -> str:
     import socket
-    import ssl
     import urllib.parse
 
     parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "http" or not parsed.hostname:
+        raise ValueError("VPNGate API 地址必须是有效的 HTTP URL")
     domain = parsed.hostname or "www.vpngate.net"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    is_https = parsed.scheme == "https"
+    port = parsed.port or 80
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
@@ -139,42 +123,16 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
             req = b"\x05\x01\x00" + bytes([atyp]) + addr_bytes + port.to_bytes(2, 'big')
             s.sendall(req)
             read_socks5_connect_reply(s)
-            # If HTTPS, wrap socket with SSL
-            if is_https:
-                ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
-                s = ctx.wrap_socket(s, server_hostname=domain)
-        else: # http proxy
-            if is_https:
-                # HTTP CONNECT tunnel
-                authority = format_host_port(domain, port)
-                auth_header = proxy_basic_auth_header(proxy_user, proxy_pass or "") if proxy_user is not None else ""
-                req_str = f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\n{auth_header}Proxy-Connection: Keep-Alive\r\n\r\n"
-                s.sendall(req_str.encode('ascii'))
-                resp = read_http_response_head(s)
-                status_line = resp.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-                status_parts = status_line.split()
-                status_code = int(status_parts[1]) if len(status_parts) >= 2 and status_parts[1].isdigit() else 0
-                if status_code != 200:
-                    raise RuntimeError(f"HTTP CONNECT tunnel failed: {status_line}")
-                # Wrap socket with SSL
-                ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
-                s = ctx.wrap_socket(s, server_hostname=domain)
-            else:
-                # Direct HTTP request through proxy: request URI must be absolute
-                pass
 
         # Send HTTP GET request
-        if ptype == "http" and not is_https:
-            request_uri = url
-        else:
-            request_uri = path
+        request_uri = url if ptype == "http" else path
 
         req_headers = (
             f"GET {request_uri} HTTP/1.1\r\n"
             f"Host: {domain}\r\n"
             f"User-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\n"
             f"Accept: text/plain,*/*\r\n"
-            f"{proxy_basic_auth_header(proxy_user, proxy_pass or '') if ptype == 'http' and not is_https and proxy_user is not None else ''}"
+            f"{proxy_basic_auth_header(proxy_user, proxy_pass or '') if ptype == 'http' and proxy_user is not None else ''}"
             f"Connection: close\r\n\r\n"
         )
         s.sendall(req_headers.encode('utf-8'))
@@ -247,18 +205,20 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
 
     return body_part.decode('utf-8', errors='replace')
 
-def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
+def fetch_api_text(url: str | None = None) -> str:
     if url is None:
         url = API_URL
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("VPNGate API 地址必须是有效的 HTTP 或 HTTPS URL")
 
     ptype, phost, pport = vpn_utils.get_upstream_proxy()
-    if ptype and phost and pport:
+    if parsed.scheme.lower() == "http" and ptype and phost and pport:
         try:
             print(f"[fetch_api_text] 监测到上游代理 ({ptype}://{phost}:{pport})，尝试通过代理获取 API...", flush=True)
-            return fetch_api_text_via_proxy(url, ptype, phost, pport, use_ssl_verify)
+            return fetch_api_text_via_proxy(url, ptype, phost, pport)
         except Exception as e:
             print(f"[fetch_api_text] 通过代理获取 API 失败: {e}，尝试使用直连/默认系统代理...", flush=True)
-            log_to_json("WARNING", "Main", f"使用代理 {ptype}://{phost}:{pport} 获取 API 失败: {e}")
 
     request = urllib.request.Request(
         url,
@@ -267,14 +227,8 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
             "Accept": "text/plain,*/*",
         },
     )
-    if url.startswith("https://") and not use_ssl_verify:
-        import ssl
-        ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(request, timeout=12, context=ctx) as response:
-            return response.read().decode("utf-8", errors="replace")
-    else:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            return response.read().decode("utf-8", errors="replace")
+    with urllib.request.urlopen(request, timeout=12) as response:
+        return response.read().decode("utf-8", errors="replace")
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
@@ -283,7 +237,9 @@ def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     return list(csv.DictReader(lines))
 
 def decode_config(encoded: str) -> str:
-    return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+    config_text = base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8", errors="strict")
+    validate_openvpn_config(config_text)
+    return config_text
 
 def load_blacklist() -> dict[str, dict[str, Any]]:
     now = time.time()
@@ -350,6 +306,7 @@ def row_to_node(row: dict[str, str], config_text: str, fetched_at: float | None 
 
 def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
     scan_limit = MAX_SCAN_ROWS if max_scan_rows is None else max(1, int(max_scan_rows))
+    target_url = API_URL
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
@@ -358,26 +315,20 @@ def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
 
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
-    attempts_targets = [
-        (API_URL, True),
-        (API_URL, False)
-    ]
-    if API_URL.startswith("https://"):
-        attempts_targets.append((API_URL.replace("https://", "http://"), True))
+    # Profile contents remain protected by the OpenVPN directive allowlist.
+    attempts_targets = [target_url]
 
-    log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
+    log_to_json("INFO", "Main", f"开始拉取 VPNGate API 节点列表: {target_url}")
 
     last_err = None
-    for url, verify_ssl in attempts_targets:
+    for url in attempts_targets:
         for i in range(max_attempts):
             if i > 0:
                 time.sleep(1.5)
             try:
-                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
+                msg = f"尝试拉取 {url} (第 {i+1} 次尝试)..."
                 print(f"[fetch_candidates] {msg}", flush=True)
-                log_to_json("INFO", "Main", msg)
-                api_text = fetch_api_text(url, verify_ssl)
+                api_text = fetch_api_text(url)
                 rows = parse_vpngate_rows(api_text)
                 snapshot_fetched_at = time.time()
                 for row in rows[:scan_limit]:
@@ -392,7 +343,6 @@ def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
                         node = row_to_node(row, config_text, snapshot_fetched_at)
                     except Exception as row_exc:
                         print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
-                        log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
                         continue
                     entry = blacklist.get(node["id"])
                     if entry and float(entry.get("until", 0) or 0) > time.time():
@@ -403,20 +353,19 @@ def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
                     break
             except Exception as e:
                 last_err = e
-                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
-                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
+                print(f"[fetch_candidates] 拉取失败 (URL: {url}): {e}", flush=True)
         if candidates:
             break
 
     if not candidates:
-        err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
+        err_code, diag_msg = vpn_utils.diagnose_api_failure(target_url)
         full_err_msg = f"获取官方 API 节点最终失败: {last_err} | 诊断结果: {diag_msg}"
         print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
-        log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
         _set_state(
             last_fetch_status="error",
             last_fetch_error_code=err_code,
-            last_fetch_message=diag_msg
+            last_fetch_message=diag_msg,
+            api_url=target_url,
         )
         if last_err:
             raise RuntimeError(diag_msg) from last_err
@@ -427,9 +376,10 @@ def fetch_candidates(max_scan_rows: int | None = None) -> list[dict[str, Any]]:
         last_fetch_at=time.time(),
         last_fetch_status="ok",
         last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        api_url=target_url,
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"成功获取 VPNGate API 节点，共 {len(candidates)} 个候选节点")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:

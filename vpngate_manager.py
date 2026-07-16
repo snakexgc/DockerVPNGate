@@ -91,7 +91,9 @@ from vpngate_app.config import (
 )
 from vpngate_app.logging_io import Tee
 from vpngate_app.logging_utils import log_to_json, read_log_entries
-from vpngate_app.storage import load_ui_config, read_json, read_nodes, save_ui_config, write_json
+from vpngate_app.storage import (
+    load_ui_config, read_json, read_nodes, update_ui_config, write_json,
+)
 from vpngate_app.traffic import TrafficMonitor
 from vpngate_app.node_testing import (
     LATENCY_SOURCE, NODE_STATUS_AVAILABLE, NODE_STATUS_NOT_CHECKED, NODE_STATUS_QUEUED,
@@ -116,6 +118,8 @@ from vpngate_app.vpngate_source import (
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
 active_sessions: dict[str, float] = {}
+proxy_connection_condition = threading.Condition()
+active_proxy_connection_operations = 0
 
 traffic_monitor = TrafficMonitor(PROXY_INTERFACES)
 sample_traffic_slot = traffic_monitor.sample_slot
@@ -142,6 +146,7 @@ proxy_slots_runtime: list[dict[str, Any]] = [
         "last_health_check": 0.0,
         "last_google204_check": 0.0,
         "google204_timeout_failures": 0,
+        "connection_generation": 0,
     }
     for _ in PROXY_PORTS
 ]
@@ -185,9 +190,12 @@ def configured_node_retest_seconds(config: dict[str, Any] | None = None) -> int:
 
 
 def set_state(**updates: Any) -> None:
-    state = get_state()
-    state.update(updates)
-    write_json(STATE_FILE, state)
+    # set_state is called by the collector, node workers, OpenVPN readers and
+    # HTTP handlers. Keep the complete read/modify/write transaction serialized.
+    with lock:
+        state = get_state()
+        state.update(updates)
+        write_json(STATE_FILE, state)
 
 configure_state_writer(set_state)
 configure_openvpn_state_writer(set_state)
@@ -203,7 +211,7 @@ def get_state() -> dict[str, Any]:
         or node_test_start_pending.is_set()
         or node_test_batch_active
     )
-    state.setdefault("api_url", API_URL)
+    state["api_url"] = API_URL
     state["fetch_interval_seconds"] = node_pool_retest_interval_seconds(
         seconds_per_node=configured_node_retest_seconds(config)
     )
@@ -281,6 +289,7 @@ def _stop_proxy_slot_locked(index: int, reason: str = "") -> None:
         health_failures=0,
         last_google204_check=0.0,
         google204_timeout_failures=0,
+        connection_generation=int(runtime.get("connection_generation") or 0) + 1,
     )
 
 
@@ -300,6 +309,46 @@ def node_for_runtime(index: int, nodes: list[dict[str, Any]] | None = None) -> d
         return None
     source = nodes if nodes is not None else read_nodes()
     return next((node for node in source if node.get("id") == node_id), None)
+
+
+def mutate_cached_node(node_id: str, mutator: Any) -> dict[str, Any] | None:
+    """Update one node against the latest file snapshot without stale overwrites."""
+    with lock:
+        nodes = read_nodes()
+        node = next((item for item in nodes if str(item.get("id") or "") == node_id), None)
+        if node is None:
+            return None
+        changed = mutator(node)
+        if changed is not False:
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+        return dict(node)
+
+
+def begin_proxy_connection(allow_during_maintenance: bool = False) -> None:
+    global active_proxy_connection_operations
+    with proxy_connection_condition:
+        maintenance_pending = (
+            maintenance_lock.locked()
+            or node_refresh_pending.is_set()
+            or node_test_start_pending.is_set()
+            or node_test_batch_active
+        )
+        if maintenance_pending and not allow_during_maintenance:
+            raise RuntimeError("节点维护或测试正在运行，请完成后再连接代理")
+        active_proxy_connection_operations += 1
+
+
+def end_proxy_connection() -> None:
+    global active_proxy_connection_operations
+    with proxy_connection_condition:
+        active_proxy_connection_operations = max(0, active_proxy_connection_operations - 1)
+        proxy_connection_condition.notify_all()
+
+
+def wait_for_proxy_connections() -> None:
+    with proxy_connection_condition:
+        while active_proxy_connection_operations:
+            proxy_connection_condition.wait(timeout=0.5)
 
 
 def used_node_ids(exclude_index: int | None = None) -> set[str]:
@@ -366,11 +415,18 @@ def slot_candidates(
     return candidates
 
 
-def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False) -> str:
+def connect_proxy_slot(
+    index: int,
+    node_id: str,
+    update_preference: bool = False,
+    allow_during_maintenance: bool = False,
+) -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("节点 ID 不能为空")
+    begin_proxy_connection(allow_during_maintenance)
     if not proxy_slot_locks[index].acquire(blocking=False):
+        end_proxy_connection()
         raise RuntimeError(f"代理 {index + 1} 正在执行连接任务")
     runtime = proxy_slots_runtime[index]
     runtime["connecting"] = True
@@ -382,13 +438,6 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node is None:
             raise ValueError(f"找不到节点: {node_id}")
-        if update_preference:
-            selection_config = load_ui_config()
-            selection_slot = selection_config["proxy_slots"][index]
-            if selection_slot.get("switch_mode") == "fixed":
-                selection_slot["last_node_id"] = node_id
-                selection_slot["enabled"] = True
-                save_ui_config(selection_config)
         if node_id in used_node_ids(index):
             raise RuntimeError("该节点已被其他代理端口占用，请选择不同节点")
         with lock:
@@ -411,10 +460,14 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
                 dev=PROXY_INTERFACES[index],
             )
             if not ok or process is None:
-                node["probe_status"] = NODE_STATUS_UNAVAILABLE
-                node["probe_message"] = message
-                node["probed_at"] = time.time()
-                write_json(NODES_FILE, sort_all_nodes(nodes))
+                mutate_cached_node(
+                    node_id,
+                    lambda current: current.update(
+                        probe_status=NODE_STATUS_UNAVAILABLE,
+                        probe_message=message,
+                        probed_at=time.time(),
+                    ),
+                )
                 raise RuntimeError(message)
             try:
                 setup_slot_policy_routing(index)
@@ -433,15 +486,11 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
             )
             started_new_process = True
 
-        config = load_ui_config()
-        slot_config = config["proxy_slots"][index]
-        if update_preference:
-            slot_config["preferred_country"] = str(node.get("country") or "").strip()
-        slot_config["last_node_id"] = node_id
-        slot_config["enabled"] = True
-        save_ui_config(config)
-
-        preferred_country = str(slot_config.get("preferred_country") or "").strip()
+        slot_config = load_ui_config()["proxy_slots"][index]
+        preferred_country = (
+            str(node.get("country") or "").strip()
+            if update_preference else str(slot_config.get("preferred_country") or "").strip()
+        )
         latency = parse_int(node.get("latency_ms")) if node.get("latency_source") == LATENCY_SOURCE else 0
         runtime.update(
             process=process,
@@ -460,26 +509,39 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
             raise RuntimeError(str(health.get("error") or "出口检测失败"))
         latency_ok, latency, latency_message = measure_proxy_http_latency(index)
         if not latency_ok:
-            node["latency_ms"] = 0
-            node["latency_source"] = LATENCY_SOURCE
-            node["probe_status"] = NODE_STATUS_UNAVAILABLE
-            node["probe_message"] = latency_message
-            node["probed_at"] = time.time()
-            write_json(NODES_FILE, sort_all_nodes(nodes))
+            mutate_cached_node(
+                node_id,
+                lambda current: current.update(
+                    latency_ms=0,
+                    latency_source=LATENCY_SOURCE,
+                    probe_status=NODE_STATUS_UNAVAILABLE,
+                    probe_message=latency_message,
+                    probed_at=time.time(),
+                ),
+            )
             raise RuntimeError(latency_message)
-        node["probe_status"] = NODE_STATUS_AVAILABLE
-        # Keep the comparable latency from the latest full-pool Google 204 test.
-        # The just-connected tunnel latency belongs to this active slot only and
-        # is exposed through runtime.proxy_latency_ms below.
-        write_json(NODES_FILE, sort_all_nodes(nodes))
+        mutate_cached_node(
+            node_id,
+            lambda current: current.update(probe_status=NODE_STATUS_AVAILABLE),
+        )
+
+        def persist_slot_selection(config: dict[str, Any]) -> None:
+            persisted_slot = config["proxy_slots"][index]
+            if update_preference:
+                persisted_slot["preferred_country"] = str(node.get("country") or "").strip()
+            persisted_slot["last_node_id"] = node_id
+            persisted_slot["enabled"] = True
+
+        config = update_ui_config(persist_slot_selection)
+        preferred_country = str(config["proxy_slots"][index].get("preferred_country") or "").strip()
         runtime.update(
             proxy_ok=True,
             proxy_ip=health.get("ip", "-"),
             proxy_latency_ms=latency,
-            latency_ms=latency,
             google204_timeout_failures=0,
             last_google204_check=time.time(),
             switch_country="",
+            using_fallback=bool(preferred_country and not country_matches(node.get("country"), preferred_country)),
         )
         runtime["connecting"] = False
         log_to_json("INFO", f"Proxy{index + 1}", f"已连接 {node_id}，接口 {PROXY_INTERFACES[index]}，端口 {PROXY_PORTS[index]}")
@@ -497,6 +559,7 @@ def connect_proxy_slot(index: int, node_id: str, update_preference: bool = False
                 if reserved_node_slots.get(node_id) == index:
                     reserved_node_slots.pop(node_id, None)
         proxy_slot_locks[index].release()
+        end_proxy_connection()
 
 
 def check_proxy_slot_health(index: int) -> dict[str, Any]:
@@ -524,6 +587,35 @@ def check_proxy_slot_health(index: int) -> dict[str, Any]:
         return {"ok": False, "error": result.stderr.strip() or "出口 IP 检测失败"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def test_proxy_slot_health(index: int) -> dict[str, Any]:
+    """Run a manual health check without applying a result to a newer tunnel."""
+    if maintenance_lock.locked() or node_refresh_pending.is_set() or node_test_batch_active:
+        raise RuntimeError("节点维护或测试正在运行，请完成后再检测代理")
+    runtime = proxy_slots_runtime[index]
+    process = runtime.get("process")
+    generation = int(runtime.get("connection_generation") or 0)
+    node_id = str(runtime.get("active_node_id") or "")
+    result = check_proxy_slot_health(index)
+    if not proxy_slot_locks[index].acquire(blocking=False):
+        raise RuntimeError("代理连接正在变化，本次检测结果已丢弃")
+    try:
+        if (
+            runtime.get("process") is not process
+            or int(runtime.get("connection_generation") or 0) != generation
+            or str(runtime.get("active_node_id") or "") != node_id
+        ):
+            raise RuntimeError("代理连接已切换，本次检测结果已丢弃")
+        runtime.update(
+            proxy_ok=bool(result.get("ok")),
+            proxy_ip=result.get("ip", "-") if result.get("ok") else "-",
+            proxy_latency_ms=result.get("latency_ms", 0),
+            error="" if result.get("ok") else str(result.get("error") or "检测失败"),
+        )
+        return result
+    finally:
+        proxy_slot_locks[index].release()
 
 
 def node_probe_progress_text(nodes: list[dict[str, Any]] | None = None) -> str:
@@ -578,6 +670,7 @@ def ensure_proxy_slot(
     index: int,
     nodes: list[dict[str, Any]] | None = None,
     config: dict[str, Any] | None = None,
+    allow_during_maintenance: bool = False,
 ) -> None:
     if proxy_slots_runtime[index].get("connecting"):
         return
@@ -589,7 +682,7 @@ def ensure_proxy_slot(
         return
     nodes = read_nodes() if nodes is None else nodes
     current = node_for_runtime(index, nodes)
-    wait_reason = auto_proxy_connection_wait_reason()
+    wait_reason = "" if allow_during_maintenance else auto_proxy_connection_wait_reason()
     if wait_reason:
         if not slot_process_running(index):
             proxy_slots_runtime[index]["error"] = wait_reason
@@ -616,7 +709,11 @@ def ensure_proxy_slot(
             proxy_slots_runtime[index]["error"] = "固定节点已被其他代理占用"
             return
         try:
-            connect_proxy_slot(index, fixed_node_id)
+            connect_proxy_slot(
+                index,
+                fixed_node_id,
+                **({"allow_during_maintenance": True} if allow_during_maintenance else {}),
+            )
         except Exception as exc:
             proxy_slots_runtime[index]["error"] = f"固定节点连接失败，未切换其他节点：{exc}"
             print(f"[代理 {index + 1}] 固定节点 {fixed_node_id} 连接失败: {exc}", flush=True)
@@ -647,7 +744,11 @@ def ensure_proxy_slot(
     last_error = "没有可用节点"
     for candidate in candidates[:3]:
         try:
-            connect_proxy_slot(index, str(candidate.get("id") or ""))
+            connect_proxy_slot(
+                index,
+                str(candidate.get("id") or ""),
+                **({"allow_during_maintenance": True} if allow_during_maintenance else {}),
+            )
             return
         except Exception as exc:
             last_error = str(exc)
@@ -684,8 +785,11 @@ def proxy_slot_payload(index: int, nodes: list[dict[str, Any]], config: dict[str
         "country": country,
         "country_code": node.get("country_short", "") if node else "",
         "location": node.get("location", "") if node else "",
-        "latency_ms": runtime.get("proxy_latency_ms") or runtime.get("latency_ms") or 0,
-        "node_latency_ms": runtime.get("latency_ms") or 0,
+        "latency_ms": runtime.get("proxy_latency_ms") or 0,
+        "node_latency_ms": (
+            parse_int(node.get("latency_ms"))
+            if node and node.get("latency_source") == LATENCY_SOURCE else 0
+        ),
         "owner": (node.get("owner") or node.get("as_name") or "") if node else "",
         "ip_type": node.get("ip_type", "") if node else "",
         "protocols": ["HTTP", "SOCKS5"],
@@ -1001,9 +1105,10 @@ def merge_node_cache(
 
 
 def merge_fetched_nodes(fetched: list[dict[str, Any]], capacity: int) -> list[dict[str, Any]]:
-    protected_ids = used_node_ids() | configured_fixed_node_ids()
-    merged, stats = merge_node_cache(read_nodes(), fetched, capacity, protected_ids)
-    write_json(NODES_FILE, merged)
+    with lock:
+        protected_ids = used_node_ids() | configured_fixed_node_ids()
+        merged, stats = merge_node_cache(read_nodes(), fetched, capacity, protected_ids)
+        write_json(NODES_FILE, merged)
     set_state(
         region_node_limit=stats["region_limit"],
         node_cache_size=stats["capacity"],
@@ -1018,9 +1123,10 @@ def merge_fetched_nodes(fetched: list[dict[str, Any]], capacity: int) -> list[di
 
 
 def resize_node_cache(capacity: int) -> dict[str, int]:
-    protected_ids = used_node_ids() | configured_fixed_node_ids()
-    resized, stats = merge_node_cache(read_nodes(), [], capacity, protected_ids)
-    write_json(NODES_FILE, resized)
+    with lock:
+        protected_ids = used_node_ids() | configured_fixed_node_ids()
+        resized, stats = merge_node_cache(read_nodes(), [], capacity, protected_ids)
+        write_json(NODES_FILE, resized)
     set_state(
         region_node_limit=stats["region_limit"],
         node_cache_size=stats["capacity"],
@@ -1031,6 +1137,7 @@ def resize_node_cache(capacity: int) -> dict[str, int]:
 
 def resize_node_cache_when_idle(capacity: int) -> None:
     with maintenance_lock:
+        wait_for_proxy_connections()
         resize_node_cache(capacity)
 
 
@@ -1076,44 +1183,46 @@ def measure_active_proxy_google204(index: int) -> tuple[bool, int, str, int]:
     return False, 0, combined_message, 0
 
 
-def mark_active_node_unavailable(index: int, message: str) -> None:
-    node_id = str(proxy_slots_runtime[index].get("active_node_id") or "")
+def mark_active_node_unavailable(index: int, message: str, node_id: str = "") -> None:
+    node_id = node_id or str(proxy_slots_runtime[index].get("active_node_id") or "")
     if not node_id:
         return
-    current_nodes = read_nodes()
-    for node in current_nodes:
-        if str(node.get("id") or "") == node_id:
-            node["probe_status"] = NODE_STATUS_UNAVAILABLE
-            node["probe_message"] = message
-            node["latency_ms"] = 0
-            node["latency_source"] = LATENCY_SOURCE
-            node["probed_at"] = time.time()
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
-            return
+    mutate_cached_node(
+        node_id,
+        lambda node: node.update(
+            probe_status=NODE_STATUS_UNAVAILABLE,
+            probe_message=message,
+            latency_ms=0,
+            latency_source=LATENCY_SOURCE,
+            probed_at=time.time(),
+        ),
+    )
 
 
-def update_active_node_latency(index: int, latency: int, message: str) -> None:
-    node_id = str(proxy_slots_runtime[index].get("active_node_id") or "")
+def update_active_node_latency(index: int, latency: int, message: str, node_id: str = "") -> None:
+    node_id = node_id or str(proxy_slots_runtime[index].get("active_node_id") or "")
     if not node_id:
         return
-    current_nodes = read_nodes()
-    for node in current_nodes:
-        if str(node.get("id") or "") == node_id:
-            # Pool latencies must remain from the same batch test so candidates
-            # stay comparable. Only repair legacy/missing probe data here; the
-            # active slot's live latency is kept in proxy_slots_runtime.
-            if (
-                node.get("probe_status") != NODE_STATUS_AVAILABLE
-                or node.get("latency_source") != LATENCY_SOURCE
-                or parse_int(node.get("latency_ms")) <= 0
-            ):
-                node["latency_ms"] = latency
-                node["latency_source"] = LATENCY_SOURCE
-                node["probe_status"] = NODE_STATUS_AVAILABLE
-                node["probe_message"] = message
-                node["probed_at"] = time.time()
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
-            return
+
+    def repair_missing_latency(node: dict[str, Any]) -> bool:
+        # Pool latencies must remain from the same batch test so candidates stay
+        # comparable. The active slot's live latency only lives in runtime state.
+        if (
+            node.get("probe_status") == NODE_STATUS_AVAILABLE
+            and node.get("latency_source") == LATENCY_SOURCE
+            and parse_int(node.get("latency_ms")) > 0
+        ):
+            return False
+        node.update(
+            latency_ms=latency,
+            latency_source=LATENCY_SOURCE,
+            probe_status=NODE_STATUS_AVAILABLE,
+            probe_message=message,
+            probed_at=time.time(),
+        )
+        return True
+
+    mutate_cached_node(node_id, repair_missing_latency)
 
 
 def node_probe_is_pending(node: dict[str, Any]) -> bool:
@@ -1173,6 +1282,7 @@ def continue_pending_node_tests(wait: bool = False) -> str:
     if not maintenance_lock.acquire(blocking=wait):
         return "节点维护任务正在运行"
     try:
+        wait_for_proxy_connections()
         if node_refresh_pending.is_set():
             return "节点更新任务正在等待执行，暂不续测排队节点"
 
@@ -1193,7 +1303,7 @@ def continue_pending_node_tests(wait: bool = False) -> str:
             test_multiple_nodes(node_ids, worker_count)
 
         for index in range(len(PROXY_PORTS)):
-            ensure_proxy_slot(index)
+            ensure_proxy_slot(index, allow_during_maintenance=True)
 
         current_nodes = read_nodes()
         remaining = pending_probe_count_from_nodes(current_nodes)
@@ -1220,8 +1330,10 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
     if not maintenance_lock.acquire(blocking=wait):
         return "节点维护任务正在运行"
     try:
+        wait_for_proxy_connections()
         last_collector_heartbeat = time.time()
-        existing_snapshot = read_nodes()
+        with lock:
+            existing_snapshot = read_nodes()
         config = load_ui_config()
         worker_count = configured_node_test_workers(config)
         max_scan_rows = configured_max_scan_rows(config)
@@ -1240,7 +1352,8 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         staged_refresh = bool(fetched)
         if staged_refresh:
             nodes = stage_fetched_node_candidates(existing_snapshot, fetched)
-            write_json(NODES_FILE, nodes)
+            with lock:
+                write_json(NODES_FILE, nodes)
             set_state(
                 last_fetch_candidate_count=len(fetched),
                 last_check_message=(
@@ -1262,9 +1375,10 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
             with vpn_operation_lock:
                 test_multiple_nodes(node_ids, worker_count)
         if staged_refresh:
-            protected_ids = used_node_ids() | configured_fixed_node_ids(config)
-            finalized, stats = merge_node_cache([], read_nodes(), region_limit, protected_ids)
-            write_json(NODES_FILE, finalized)
+            with lock:
+                protected_ids = used_node_ids() | configured_fixed_node_ids(config)
+                finalized, stats = merge_node_cache([], read_nodes(), region_limit, protected_ids)
+                write_json(NODES_FILE, finalized)
             set_state(
                 region_node_limit=stats["region_limit"],
                 node_cache_size=stats["capacity"],
@@ -1283,7 +1397,7 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         if full_pool_test:
             initial_node_pool_test_done = True
         for index in range(len(PROXY_PORTS)):
-            ensure_proxy_slot(index)
+            ensure_proxy_slot(index, allow_during_maintenance=True)
         current_nodes = read_nodes()
         remaining = pending_probe_count_from_nodes(current_nodes)
         if remaining:
@@ -1298,13 +1412,15 @@ def multi_maintain_nodes(force: bool = False, wait: bool = False) -> str:
         return message
     except NodeTestCancelled:
         if 'staged_refresh' in locals() and staged_refresh:
-            write_json(NODES_FILE, existing_snapshot)
+            with lock:
+                write_json(NODES_FILE, existing_snapshot)
         message = "节点测试已取消，正在切换到更新节点流程"
         set_state(last_check_message=message)
         return message
     except Exception:
         if 'staged_refresh' in locals() and staged_refresh:
-            write_json(NODES_FILE, existing_snapshot)
+            with lock:
+                write_json(NODES_FILE, existing_snapshot)
         raise
     finally:
         maintenance_lock.release()
@@ -1314,6 +1430,7 @@ def test_cached_node_pool() -> str:
     if not maintenance_lock.acquire(blocking=False):
         return "节点维护任务正在运行"
     try:
+        wait_for_proxy_connections()
         if node_refresh_pending.is_set():
             return "连接测试已让路给更新节点"
         config = load_ui_config()
@@ -1328,7 +1445,7 @@ def test_cached_node_pool() -> str:
             with vpn_operation_lock:
                 test_multiple_nodes(node_ids, worker_count)
         for index in range(len(PROXY_PORTS)):
-            ensure_proxy_slot(index)
+            ensure_proxy_slot(index, allow_during_maintenance=True)
         current_nodes = read_nodes()
         available = sum(1 for node in current_nodes if node.get("probe_status") == NODE_STATUS_AVAILABLE)
         unavailable = sum(1 for node in current_nodes if node.get("probe_status") == NODE_STATUS_UNAVAILABLE)
@@ -1387,64 +1504,77 @@ def run_active_proxy_google204_check(index: int, nodes: list[dict[str, Any]], no
     runtime = proxy_slots_runtime[index]
     if not slot_process_running(index):
         return
+    process = runtime.get("process")
+    generation = int(runtime.get("connection_generation") or 0)
+    node_id = str(runtime.get("active_node_id") or "")
     now = time.time() if now is None else now
     last_check = float(runtime.get("last_google204_check") or 0)
     if last_check and now - last_check < ACTIVE_PROXY_GOOGLE204_INTERVAL_SECONDS:
         return
 
-    node = node_for_runtime(index, nodes)
-    if node:
-        runtime["latency_ms"] = (
-            parse_int(node.get("latency_ms"))
-            if node.get("latency_source") == LATENCY_SOURCE else 0
-        )
-
     ok, latency, message, timeout_attempts = measure_active_proxy_google204(index)
-    checked_at = time.time()
-    runtime["last_health_check"] = checked_at
-    runtime["last_google204_check"] = checked_at
-
-    if ok:
-        runtime.update(
-            proxy_ok=True,
-            proxy_latency_ms=latency,
-            latency_ms=latency,
-            error="",
-            health_failures=0,
-            google204_timeout_failures=0,
-        )
-        update_active_node_latency(index, latency, message)
+    if maintenance_lock.locked() or node_refresh_pending.is_set() or node_test_batch_active:
         return
-
-    runtime["proxy_ok"] = False
-    runtime["error"] = str(message or "Google 204 检测失败")
-    runtime["health_failures"] = int(runtime.get("health_failures") or 0) + 1
-
-    if not timeout_attempts:
-        runtime["google204_timeout_failures"] = 0
+    if not proxy_slot_locks[index].acquire(blocking=False):
         return
+    try:
+        if (
+            runtime.get("process") is not process
+            or int(runtime.get("connection_generation") or 0) != generation
+            or str(runtime.get("active_node_id") or "") != node_id
+            or runtime.get("connecting")
+        ):
+            return
 
-    timeout_failures = int(runtime.get("google204_timeout_failures") or 0) + timeout_attempts
-    runtime["google204_timeout_failures"] = timeout_failures
-    runtime["error"] = f"Google 204 连续超时 {timeout_failures} 次: {message}"
+        checked_at = time.time()
+        runtime["last_health_check"] = checked_at
+        runtime["last_google204_check"] = checked_at
 
-    config = load_ui_config()["proxy_slots"][index]
-    if timeout_failures >= ACTIVE_PROXY_GOOGLE204_TIMEOUT_LIMIT:
-        if str(config.get("switch_mode") or "auto") == "auto":
-            switch_message = (
-                f"Google 204 连续超时 {timeout_failures} 次，"
-                "已标记当前节点不可用并自动切换"
+        if ok:
+            runtime.update(
+                proxy_ok=True,
+                proxy_latency_ms=latency,
+                error="",
+                health_failures=0,
+                google204_timeout_failures=0,
             )
-            failed_node = node_for_runtime(index, nodes)
-            switch_country = str(failed_node.get("country") or "").strip() if failed_node else ""
-            mark_active_node_unavailable(index, switch_message)
-            stop_proxy_slot(index, switch_message)
-            runtime["switch_country"] = switch_country
-        else:
-            runtime["error"] = (
-                f"Google 204 连续超时 {timeout_failures} 次，"
-                "固定选中模式不自动切换"
-            )
+            update_active_node_latency(index, latency, message, node_id)
+            return
+
+        runtime["proxy_ok"] = False
+        runtime["error"] = str(message or "Google 204 检测失败")
+        runtime["health_failures"] = int(runtime.get("health_failures") or 0) + 1
+
+        if not timeout_attempts:
+            runtime["google204_timeout_failures"] = 0
+            return
+
+        timeout_failures = int(runtime.get("google204_timeout_failures") or 0) + timeout_attempts
+        runtime["google204_timeout_failures"] = timeout_failures
+        runtime["error"] = f"Google 204 连续超时 {timeout_failures} 次: {message}"
+
+        config = load_ui_config()["proxy_slots"][index]
+        if timeout_failures >= ACTIVE_PROXY_GOOGLE204_TIMEOUT_LIMIT:
+            if str(config.get("switch_mode") or "auto") == "auto":
+                switch_message = (
+                    f"Google 204 连续超时 {timeout_failures} 次，"
+                    "已标记当前节点不可用并自动切换"
+                )
+                failed_node = next(
+                    (node for node in nodes if str(node.get("id") or "") == node_id),
+                    None,
+                )
+                switch_country = str(failed_node.get("country") or "").strip() if failed_node else ""
+                mark_active_node_unavailable(index, switch_message, node_id)
+                _stop_proxy_slot_locked(index, switch_message)
+                runtime["switch_country"] = switch_country
+            else:
+                runtime["error"] = (
+                    f"Google 204 连续超时 {timeout_failures} 次，"
+                    "固定选中模式不自动切换"
+                )
+    finally:
+        proxy_slot_locks[index].release()
 
 
 def multi_collector_loop() -> None:
@@ -1480,6 +1610,14 @@ def multi_collector_loop() -> None:
 def multi_proxy_monitor() -> None:
     while True:
         try:
+            if (
+                maintenance_lock.locked()
+                or node_refresh_pending.is_set()
+                or node_test_start_pending.is_set()
+                or node_test_batch_active
+            ):
+                time.sleep(1)
+                continue
             nodes = read_nodes()
             config = load_ui_config()
             for index in range(len(PROXY_PORTS)):

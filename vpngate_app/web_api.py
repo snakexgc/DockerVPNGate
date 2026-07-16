@@ -335,18 +335,29 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("设置新的代理用户名时必须同时填写代理密码")
                 if not proxy_username and proxy_password:
                     raise ValueError("代理用户名和密码必须同时填写或同时留空")
-                config["username"] = username
-                if password:
-                    config["password"] = password
-                config["secret_path"] = secret_path
-                config["proxy_username"] = proxy_username
-                config["proxy_password"] = proxy_password
                 old_region_node_limit = int(config.get("region_node_limit", APP.DEFAULT_REGION_NODE_LIMIT))
-                config["region_node_limit"] = region_node_limit
-                config["node_test_workers"] = node_test_workers
-                config["max_scan_rows"] = max_scan_rows
-                config["node_auto_retest_seconds_per_node"] = node_retest_seconds
-                APP.save_ui_config(config)
+                baseline_keys = (
+                    "username", "password", "secret_path", "proxy_username", "proxy_password",
+                    "region_node_limit", "node_test_workers", "max_scan_rows",
+                    "node_auto_retest_seconds_per_node",
+                )
+                baseline = {key: config.get(key) for key in baseline_keys}
+
+                def commit_settings(latest: dict[str, Any]) -> None:
+                    if any(latest.get(key) != baseline[key] for key in baseline_keys):
+                        raise RuntimeError("设置已被另一个请求修改，请刷新页面后重试")
+                    latest["username"] = username
+                    if password:
+                        latest["password"] = password
+                    latest["secret_path"] = secret_path
+                    latest["proxy_username"] = proxy_username
+                    latest["proxy_password"] = proxy_password
+                    latest["region_node_limit"] = region_node_limit
+                    latest["node_test_workers"] = node_test_workers
+                    latest["max_scan_rows"] = max_scan_rows
+                    latest["node_auto_retest_seconds_per_node"] = node_retest_seconds
+
+                config = APP.update_ui_config(commit_settings)
                 if region_node_limit != old_region_node_limit:
                     threading.Thread(
                         target=APP.resize_node_cache_when_idle,
@@ -371,8 +382,6 @@ class Handler(BaseHTTPRequestHandler):
             elif effective_path == "/api/slots/update":
                 payload = self.read_json_body()
                 index = APP.proxy_slot_index(payload.get("slot"))
-                config = APP.load_ui_config()
-                slot = config["proxy_slots"][index]
                 country = str(payload.get("preferred_country") or "").strip()
                 ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 switch_mode = str(payload.get("switch_mode") or "auto").strip()
@@ -380,11 +389,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("无效的 IP 类型")
                 if switch_mode not in ("auto", "fixed"):
                     raise ValueError("无效的节点失效策略")
-                slot["preferred_country"] = country
-                slot["routing_ip_type"] = ip_type
-                slot["switch_mode"] = switch_mode
-                slot["enabled"] = bool(payload.get("enabled", True))
-                APP.save_ui_config(config)
+                enabled = bool(payload.get("enabled", True))
+
+                def commit_slot(latest: dict[str, Any]) -> None:
+                    slot = latest["proxy_slots"][index]
+                    slot["preferred_country"] = country
+                    slot["routing_ip_type"] = ip_type
+                    slot["switch_mode"] = switch_mode
+                    slot["enabled"] = enabled
+
+                config = APP.update_ui_config(commit_slot)
+                slot = config["proxy_slots"][index]
                 if not slot["enabled"]:
                     APP.stop_proxy_slot(index, "已在面板中停用")
                 else:
@@ -400,9 +415,9 @@ class Handler(BaseHTTPRequestHandler):
             elif effective_path == "/api/slots/disconnect":
                 payload = self.read_json_body()
                 index = APP.proxy_slot_index(payload.get("slot"))
-                config = APP.load_ui_config()
-                config["proxy_slots"][index]["enabled"] = False
-                APP.save_ui_config(config)
+                APP.update_ui_config(
+                    lambda latest: latest["proxy_slots"][index].update(enabled=False)
+                )
                 APP.stop_proxy_slot(index, "已手动断开")
                 self.send_json({"ok": True})
 
@@ -452,6 +467,13 @@ class Handler(BaseHTTPRequestHandler):
                     })
 
             elif effective_path == "/api/nodes/test":
+                if (
+                    APP.maintenance_lock.locked()
+                    or APP.node_refresh_pending.is_set()
+                    or APP.node_test_is_active()
+                    or APP.node_test_start_pending.is_set()
+                ):
+                    raise RuntimeError("节点维护或批量测试正在运行，请完成后再检测单个节点")
                 payload = self.read_json_body()
                 node_id = str(payload.get("node_id") or "").strip()
                 if not node_id:
@@ -462,13 +484,7 @@ class Handler(BaseHTTPRequestHandler):
             elif effective_path == "/api/slots/test":
                 payload = self.read_json_body()
                 index = APP.proxy_slot_index(payload.get("slot"))
-                result = APP.check_proxy_slot_health(index)
-                APP.proxy_slots_runtime[index].update(
-                    proxy_ok=bool(result.get("ok")),
-                    proxy_ip=result.get("ip", "-") if result.get("ok") else "-",
-                    proxy_latency_ms=result.get("latency_ms", 0),
-                    error="" if result.get("ok") else str(result.get("error") or "检测失败"),
-                )
+                result = APP.test_proxy_slot_health(index)
                 self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY)
 
             else:

@@ -63,6 +63,10 @@ COUNTRY_TRANSLATIONS = {
     "Kazakhstan": "哈萨克斯坦",
     "Georgia": "格鲁吉亚",
     "Mongolia": "蒙古",
+    "Myanmar": "缅甸",
+    "Myanmar (Burma)": "缅甸",
+    "Burma": "缅甸",
+    "MM": "缅甸",
     "Saudi Arabia": "沙特阿拉伯",
     "Iran": "伊朗",
     "Iraq": "伊拉克",
@@ -336,10 +340,11 @@ def check_and_fix_dns() -> None:
         pass
 
     network_ok = False
-    # Test IPv4 DNS servers first, then IPv6
+    # Test foreign IPv4 DNS servers first, then the domestic fallback and IPv6.
     dns_targets = [
-        ("8.8.8.8", 53, socket.AF_INET),
         ("1.1.1.1", 53, socket.AF_INET),
+        ("8.8.8.8", 53, socket.AF_INET),
+        ("223.5.5.5", 53, socket.AF_INET),
         ("2001:4860:4860::8888", 53, socket.AF_INET6),
         ("2606:4700:4700::1111", 53, socket.AF_INET6),
     ]
@@ -367,10 +372,14 @@ def check_and_fix_dns() -> None:
     if resolv_file.exists():
         try:
             content = resolv_file.read_text(encoding="utf-8", errors="replace")
-            if "nameserver 1.1.1.1" not in content and "nameserver 8.8.8.8" not in content:
+            desired_nameservers = ("1.1.1.1", "8.8.8.8", "223.5.5.5")
+            missing_nameservers = [
+                address for address in desired_nameservers if f"nameserver {address}" not in content
+            ]
+            if missing_nameservers:
                 print("[dns_heal] Resolving names failed, but IP network is OK. Appending public DNS to /etc/resolv.conf...", flush=True)
                 with open("/etc/resolv.conf", "a", encoding="utf-8") as f:
-                    f.write("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+                    f.write("\n" + "".join(f"nameserver {address}\n" for address in missing_nameservers))
         except Exception as e:
             print(f"[dns_heal] Failed to write DNS fallback: {e}", flush=True)
 

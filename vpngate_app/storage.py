@@ -6,6 +6,7 @@ import os
 import random
 import string
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,12 @@ def load_ui_config() -> dict[str, Any]:
             if key not in data:
                 updated = True
             config[key] = str(config.get(key) or "")
+        if "api_url" in config:
+            config.pop("api_url", None)
+            updated = True
+        if "api_ssl_verify" in config:
+            config.pop("api_ssl_verify", None)
+            updated = True
         legacy_cache_size = config.pop("node_cache_size", None)
         if legacy_cache_size is not None:
             updated = True
@@ -192,6 +199,15 @@ def load_ui_config() -> dict[str, Any]:
 
 def save_ui_config(config: dict[str, Any]) -> None:
     write_json(DATA_DIR / "ui_auth.json", config)
+
+
+def update_ui_config(mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Serialize a complete UI-config read/modify/write transaction."""
+    with storage_lock:
+        config = load_ui_config()
+        mutator(config)
+        save_ui_config(config)
+        return copy.deepcopy(config)
 
 
 def read_nodes() -> list[dict[str, Any]]:

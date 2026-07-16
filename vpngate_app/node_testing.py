@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
 import queue
 import socket
 import subprocess
 import threading
 import time
-import urllib.request
 import uuid
 from pathlib import Path
 from types import ModuleType
@@ -220,10 +218,7 @@ def finish_single_node_test(generation: int, cancel_event: threading.Event) -> N
 LATENCY_TEST_URL = "https://www.google.com/generate_204"
 LATENCY_SOURCE = "google_generate_204"
 LATENCY_HTTP_TIMEOUT_SECONDS = 5
-LATENCY_DOH_URLS = (
-    "https://1.1.1.1/dns-query?name=www.google.com&type=A",
-    "https://8.8.8.8/resolve?name=www.google.com&type=A",
-)
+LATENCY_DOH_RESOLVERS = proxy_server.DOH_RESOLVERS
 latency_dns_cache: dict[str, Any] = {"ips": [], "expires_at": 0.0}
 
 
@@ -261,28 +256,21 @@ def resolve_latency_test_ips() -> list[str]:
         if cached and float(latency_dns_cache.get("expires_at") or 0) > now:
             return cached
     last_error = ""
-    for url in LATENCY_DOH_URLS:
+    for endpoint, bootstrap_ip in LATENCY_DOH_RESOLVERS:
         try:
-            request = urllib.request.Request(
-                url,
-                headers={"Accept": "application/dns-json", "User-Agent": "DockerVPNGate/1.0"},
+            resolved_ip = proxy_server.doh_query_over_interface(
+                "www.google.com",
+                1,
+                endpoint,
+                bootstrap_ip,
+                8.0,
+                None,
             )
-            with urllib.request.urlopen(request, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-            ips: list[str] = []
-            for answer in payload.get("Answer", []):
-                value = str(answer.get("data") or "").strip()
-                try:
-                    socket.inet_aton(value)
-                except OSError:
-                    continue
-                if value not in ips:
-                    ips.append(value)
-            if ips:
+            if resolved_ip:
                 with APP.lock:
-                    latency_dns_cache["ips"] = ips
+                    latency_dns_cache["ips"] = [resolved_ip]
                     latency_dns_cache["expires_at"] = now + 10 * 60
-                return ips
+                return [resolved_ip]
         except Exception as exc:
             last_error = str(exc)
     raise RuntimeError(f"无法通过可信 DoH 解析 Google 测试地址: {last_error or '无可用 A 记录'}")
